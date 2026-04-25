@@ -14,7 +14,7 @@ logger = logging.getLogger("gateway")
 app = FastAPI(title="Playwright Gateway")
 docker_client = docker.from_env()
 CONTAINER_NAME = "funds_playwright"
-TARGET_URL = f"http://{CONTAINER_NAME}:8000"
+TARGET_URL = "http://funds.playwright:8000"
 IDLE_LIMIT = 300  # 5分钟无人访问则关机
 last_access_time = 0
 
