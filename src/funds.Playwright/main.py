@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 import asyncio
 import logging
 
@@ -56,6 +57,7 @@ async def get_xueqiu_auth(ua: str = None):
         )
 
         page = await context.new_page()
+        await stealth_async(page)
 
         try:
             # 第一步：先访问首页，建立基础会话
