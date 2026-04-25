@@ -14,9 +14,10 @@ logger = logging.getLogger("gateway")
 app = FastAPI(title="Playwright Gateway")
 docker_client = docker.from_env()
 CONTAINER_NAME = "funds_playwright"
-TARGET_URL = "http://funds.playwright:8000"
+TARGET_URL = "http://funds_playwright:8000"
 IDLE_LIMIT = 300  # 5分钟无人访问则关机
 last_access_time = 0
+
 
 def idle_checker():
     """
@@ -35,8 +36,10 @@ def idle_checker():
             except Exception as e:
                 logger.error(f"Error in idle_checker: {e}")
 
+
 # 启动空闲检查线程
 threading.Thread(target=idle_checker, daemon=True).start()
+
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def proxy(request: Request, path: str):
@@ -45,7 +48,7 @@ async def proxy(request: Request, path: str):
     """
     global last_access_time
     last_access_time = time.time()
-    
+
     try:
         # 获取或唤醒容器
         container = docker_client.containers.get(CONTAINER_NAME)
@@ -74,26 +77,27 @@ async def proxy(request: Request, path: str):
             headers = dict(request.headers)
             # 移除可能引起冲突的 host
             headers.pop("host", None)
-            
+
             resp = await client.request(
                 method=request.method,
                 url=url,
                 params=params,
                 content=content,
                 headers=headers,
-                timeout=60
+                timeout=60,
             )
-            
+
             # 返回转发后的响应
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
-                headers=dict(resp.headers)
+                headers=dict(resp.headers),
             )
-            
+
     except Exception as e:
         logger.error(f"Proxy error: {e}")
         return Response(content=f"Gateway Error: {str(e)}", status_code=500)
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8081)
