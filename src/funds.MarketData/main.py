@@ -95,6 +95,23 @@ async def get_info(symbol: str, source: Optional[str] = None):
         logger.error(f"Get info failed for {symbol} via {provider_name}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/trading-days")
+async def get_trading_days(
+    exchange: str = Query(..., description="Exchange name: CN, HK, US"),
+    start: str = Query(..., description="Start date YYYY-MM-DD"),
+    end: str = Query(..., description="End date YYYY-MM-DD")
+):
+    try:
+        from core.calendar import get_exchange_trading_days
+        days = get_exchange_trading_days(exchange, start, end)
+        return {"exchange": exchange, "days": days}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Failed to get trading days for {exchange} ({start} ~ {end}): {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)
+
