@@ -8,4 +8,5 @@ redis
 pytz
 pandas-market-calendars
 holidays
+akshare
 

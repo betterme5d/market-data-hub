@@ -122,6 +122,54 @@ async def get_fund_portfolio(symbol: str, year: int = Query(..., description="Qu
         logger.error(f"Get portfolio failed for {symbol} in {year}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+def clean_dataframe(df) -> list:
+    import pandas as pd
+    import datetime
+    from core.filters import is_exchange_traded_fund
+    
+    # 先做一层交易所交易基金的过滤，仅保留场内交易基金
+    df['temp_code'] = df['基金代码'].astype(str).str.zfill(6)
+    df = df[df['temp_code'].apply(is_exchange_traded_fund)]
+    df = df.drop(columns=['temp_code'])
+    
+    records = df.to_dict(orient="records")
+    cleaned_records = []
+    for r in records:
+        cleaned_r = {}
+        for k, v in r.items():
+            if pd.isna(v):
+                cleaned_r[k] = None
+            else:
+                if isinstance(v, (pd.Timestamp, datetime.date, datetime.datetime)):
+                    cleaned_r[k] = v.strftime("%Y-%m-%d")
+                else:
+                    if k == "基金代码":
+                        cleaned_r[k] = str(v).zfill(6)
+                    else:
+                        cleaned_r[k] = v
+        cleaned_records.append(cleaned_r)
+    return cleaned_records
+
+@app.get("/api/public/fund_purchase_em")
+async def get_fund_purchase_em():
+    try:
+        import akshare as ak
+        df = ak.fund_purchase_em()
+        return clean_dataframe(df)
+    except Exception as e:
+        logger.error(f"Failed to fetch fund_purchase_em: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/public/fund_scale_open_sina")
+async def get_fund_scale_open_sina(symbol: str = Query(..., description="Sina Open Fund Type, e.g. 股票型基金")):
+    try:
+        import akshare as ak
+        df = ak.fund_scale_open_sina(symbol=symbol)
+        return clean_dataframe(df)
+    except Exception as e:
+        logger.error(f"Failed to fetch fund_scale_open_sina for {symbol}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)
