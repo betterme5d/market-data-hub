@@ -13,7 +13,8 @@ EXCHANGE_MAPPING = {
     "US": "NYSE",
     "JP": "JPX",
     "GB": "LSE",
-    "UK": "LSE"
+    "UK": "LSE",
+    "CH": "SIX"
 }
 
 HOLIDAY_TRANSLATIONS = {
@@ -28,6 +29,7 @@ HOLIDAY_TRANSLATIONS = {
     "Columbus Day": "哥伦布日",
     "Veterans Day": "退伍军人节",
     "Thanksgiving": "感恩节",
+    "Thanksgiving Day": "感恩节",
     "Christmas Day": "圣诞节",
     
     # 英国 UK/GB
@@ -37,6 +39,17 @@ HOLIDAY_TRANSLATIONS = {
     "Spring Bank Holiday": "春季银行假日",
     "Summer Bank Holiday": "夏季银行假日",
     "Boxing Day": "节礼日",
+    "May Day": "五一国际劳动节",
+    "Coronation of Charles III": "查理三世加冕日",
+    "Platinum Jubilee of Elizabeth II": "伊丽莎白二世白金禧年纪念日",
+    "State Funeral of Queen Elizabeth II": "伊丽莎白二世女王国葬日",
+    
+    # 瑞士/其它通用 English holidays
+    "Ascension Day": "耶稣升天节",
+    "Whit Monday": "圣灵降临节星期一",
+    "National Day": "国庆节",
+    "Saint Stephen's Day": "节礼日 (圣斯蒂芬日)",
+    "St. Stephen's Day": "节礼日 (圣斯蒂芬日)",
     
     # 日本 JP
     "元日": "元旦",
@@ -46,16 +59,29 @@ HOLIDAY_TRANSLATIONS = {
     "春分の日": "春分",
     "昭和の日": "昭和之日",
     "宪法記念日": "宪法纪念日",
+    "憲法記念日": "宪法纪念日",
     "みどりの日": "绿之日",
     "こどもの日": "儿童节",
     "海の日": "海洋之日",
     "山の日": "山之日",
     "敬老の日": "敬老之日",
+    "国民の休日": "国民休息日",
     "秋分の日": "秋分",
     "スポーツの日": "体育之日",
     "文化の日": "文化之日",
     "勤労感謝の日": "勤劳感谢日",
-    "振替休日": "补假日"
+    "振替休日": "补假日",
+    
+    # 瑞士 CH
+    "Neujahrstag": "元旦",
+    "Karfreitag": "耶稣受难日",
+    "Ostermontag": "复活节星期一",
+    "Tag der Arbeit": "劳动节",
+    "Auffahrt": "耶稣升天节",
+    "Pfingstmontag": "圣灵降临节星期一",
+    "Nationalfeiertag": "瑞士国庆节",
+    "Weihnachten": "圣诞节",
+    "Stephanstag": "节礼日 (圣斯蒂芬日)"
 }
 
 def translate_holiday(name: str) -> str:
@@ -114,6 +140,8 @@ def get_exchange_trading_days(exchange: str, start_date: str, end_date: str) -> 
             h_cal = holidays.JP(language="ja")
         elif exchange_upper in ("GB", "UK"):
             h_cal = holidays.GB()
+        elif exchange_upper == "CH":
+            h_cal = holidays.CH(subdiv="ZH")
 
         result = []
         for d in all_dates:

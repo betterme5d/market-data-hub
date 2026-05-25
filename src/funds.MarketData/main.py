@@ -5,6 +5,7 @@ import logging
 from core.models import UnifiedQuoteOut
 from core.cache import get_cached_quote, set_cached_quote
 from providers.yfinance import YFinanceProvider
+from providers.eastmoney import EastmoneyProvider
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -18,6 +19,8 @@ yfinance_provider = YFinanceProvider()
 PROVIDERS = {
     "yfinance": yfinance_provider
 }
+
+eastmoney_provider = EastmoneyProvider()
 
 def route_provider(symbol: str, source: Optional[str] = None) -> str:
     """
@@ -109,6 +112,14 @@ async def get_trading_days(
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         logger.error(f"Failed to get trading days for {exchange} ({start} ~ {end}): {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/fund/{symbol}/portfolio")
+async def get_fund_portfolio(symbol: str, year: int = Query(..., description="Query year, e.g., 2024")):
+    try:
+        return await eastmoney_provider.get_portfolio(symbol, year)
+    except Exception as e:
+        logger.error(f"Get portfolio failed for {symbol} in {year}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
