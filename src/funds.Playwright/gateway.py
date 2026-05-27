@@ -1,4 +1,8 @@
-import docker
+import os
+try:
+    import docker
+except ImportError:
+    docker = None
 import time
 import asyncio
 from fastapi import FastAPI, Request, Response
@@ -12,9 +16,19 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gateway")
 
 app = FastAPI(title="Playwright Gateway")
-docker_client = docker.from_env()
+
+# 检查是否在容器内运行，或指定目标服务地址
+RUNNING_IN_DOCKER = os.path.exists('/.dockerenv') or os.getenv("RUNNING_IN_DOCKER", "False").lower() == "true"
+TARGET_URL = os.getenv("PLAYWRIGHT_TARGET_URL", "http://funds_playwright:8000" if RUNNING_IN_DOCKER else "http://localhost:8098")
+
+docker_client = None
+if RUNNING_IN_DOCKER and docker is not None:
+    try:
+        docker_client = docker.from_env()
+    except Exception as e:
+        logger.warning(f"Failed to connect to docker daemon: {e}")
+
 CONTAINER_NAME = "funds_playwright"
-TARGET_URL = "http://funds_playwright:8000"
 IDLE_LIMIT = 300  # 5分钟无人访问则关机
 last_access_time = 0
 
@@ -24,6 +38,8 @@ def idle_checker():
     后台线程：检查空闲时间并停止重型容器
     """
     global last_access_time
+    if not docker_client:
+        return
     while True:
         time.sleep(30)
         if last_access_time > 0 and (time.time() - last_access_time) > IDLE_LIMIT:
@@ -38,7 +54,8 @@ def idle_checker():
 
 
 # 启动空闲检查线程
-threading.Thread(target=idle_checker, daemon=True).start()
+if docker_client:
+    threading.Thread(target=idle_checker, daemon=True).start()
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
@@ -50,22 +67,36 @@ async def proxy(request: Request, path: str):
     last_access_time = time.time()
 
     try:
-        # 获取或唤醒容器
-        container = docker_client.containers.get(CONTAINER_NAME)
-        if container.status != "running":
-            logger.info("Waking up Playwright service...")
-            container.start()
-            # 轮询检查服务是否就绪 (健康检查接口)
-            for i in range(15):
+        # 获取或唤醒容器 (仅在 Docker 模式下运行)
+        if docker_client:
+            container = docker_client.containers.get(CONTAINER_NAME)
+            if container.status != "running":
+                logger.info("Waking up Playwright service...")
+                container.start()
+
+        # 检查并等待服务就绪 (在 Docker 和宿主机本地模式下均适用)
+        is_ready = False
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(f"{TARGET_URL}/health", timeout=1)
+                if r.status_code == 200:
+                    is_ready = True
+        except:
+            pass
+
+        if not is_ready:
+            logger.info("Playwright service is not ready yet. Waiting for it to boot up...")
+            for i in range(25):
                 await asyncio.sleep(1)
                 try:
                     async with httpx.AsyncClient() as client:
                         r = await client.get(f"{TARGET_URL}/health", timeout=1)
                         if r.status_code == 200:
-                            logger.info("Playwright service is ready.")
+                            logger.info(f"Playwright service is ready after {i+1} seconds.")
+                            is_ready = True
                             break
                 except:
-                    if i == 14:
+                    if i == 24:
                         logger.error("Wait for playwright service timeout.")
                     continue
 
@@ -100,4 +131,4 @@ async def proxy(request: Request, path: str):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8081)
+    uvicorn.run(app, host="0.0.0.0", port=8099)

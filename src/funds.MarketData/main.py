@@ -170,6 +170,45 @@ async def get_fund_scale_open_sina(symbol: str = Query(..., description="Sina Op
         logger.error(f"Failed to fetch fund_scale_open_sina for {symbol}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/xueqiu/kline")
+async def get_xueqiu_kline(
+    symbol: str,
+    begin: int,
+    period: str = "day",
+    type: str = "normal",
+    count: int = -31,
+    indicator: str = "kline"
+):
+    """
+    转发雪球K线获取请求到 Playwright 鉴权网关
+    """
+    import httpx
+    # 容器间网络域名为 funds.playwright.gateway，端口为 8081
+    gateway_url = "http://funds.playwright.gateway:8081/xueqiu/kline"
+    params = {
+        "symbol": symbol,
+        "begin": begin,
+        "period": period,
+        "type": type,
+        "count": count,
+        "indicator": indicator
+    }
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(gateway_url, params=params, timeout=60)
+            if resp.status_code != 200:
+                logger.error(f"Playwright gateway returned non-200 code: {resp.status_code}, body: {resp.text}")
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            return resp.json()
+    except httpx.HTTPError as he:
+        logger.error(f"HTTP error during communication with Playwright gateway: {he}")
+        raise HTTPException(status_code=502, detail=f"Playwright Gateway communication failed: {str(he)}")
+    except Exception as e:
+        logger.error(f"Unexpected error when proxying to Playwright gateway: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)
