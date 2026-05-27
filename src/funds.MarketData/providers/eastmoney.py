@@ -344,3 +344,36 @@ class EastmoneyProvider:
             "year": year,
             "portfolios": sorted_portfolios
         }
+
+    def get_fund_info(self, symbol: str) -> Dict[str, Any]:
+        """
+        获取基金基本信息，包括业绩比较基准。
+        通过 AkShare fund_individual_basic_info_xq 接口从雪球获取。
+        返回 item/value 两列 DataFrame，转为 key-value dict 后提取字段。
+        """
+        import akshare as ak
+        import pandas as pd
+        try:
+            df = ak.fund_individual_basic_info_xq(symbol=symbol)
+            if df is None or df.empty:
+                logger.warning(f"No fund info returned for {symbol}")
+                return {"fund_code": symbol, "error": "No data returned"}
+
+            items = dict(zip(df["item"], df["value"]))
+
+            def _safe_str(val) -> Optional[str]:
+                if val is None or (isinstance(val, float) and pd.isna(val)):
+                    return None
+                s = str(val).strip()
+                return s if s else None
+
+            return {
+                "fund_code": str(items.get("基金代码", symbol)),
+                "fund_name": str(items.get("基金名称", "")),
+                "fund_type": str(items.get("基金类型", "")),
+                "benchmark_desc": _safe_str(items.get("业绩比较基准")),
+                "tracking_index": _safe_str(items.get("跟踪标的")),
+            }
+        except Exception as e:
+            logger.error(f"Failed to fetch fund info for {symbol}: {e}")
+            return {"fund_code": symbol, "error": str(e)}

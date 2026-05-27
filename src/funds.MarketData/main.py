@@ -122,6 +122,14 @@ async def get_fund_portfolio(symbol: str, year: int = Query(..., description="Qu
         logger.error(f"Get portfolio failed for {symbol} in {year}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/fund/{symbol}/info")
+async def get_fund_info(symbol: str):
+    try:
+        return eastmoney_provider.get_fund_info(symbol)
+    except Exception as e:
+        logger.error(f"Get fund info failed for {symbol}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 def clean_dataframe(df) -> list:
     import pandas as pd
     import datetime
