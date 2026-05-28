@@ -217,6 +217,72 @@ async def get_xueqiu_kline(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ============================================================
+# 申万行业指数 API
+# ============================================================
+
+import urllib.request
+import http.cookiejar
+import ssl
+import json
+
+# 全局共享的 HTTP opener（带 SSL 忽略）
+_sws_opener = None
+_sws_headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    'Referer': 'https://www.swsresearch.com/',
+    'X-Requested-With': 'XMLHttpRequest',
+}
+
+def _get_sws_opener():
+    global _sws_opener
+    if _sws_opener is None:
+        cj = http.cookiejar.CookieJar()
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        _sws_opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ctx),
+            urllib.request.HTTPCookieProcessor(cj)
+        )
+    return _sws_opener
+
+def _sws_api(path: str) -> dict:
+    from urllib.parse import quote
+    opener = _get_sws_opener()
+    url = f"https://www.swsresearch.com/institute-sw/api/{path}"
+    req = urllib.request.Request(url, headers=_sws_headers)
+    with opener.open(req, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+@app.get("/api/sws/industries")
+async def get_sws_industries(indextype: str = "一级行业"):
+    """获取申万行业指数代码列表"""
+    from urllib.parse import quote
+    result = _sws_api(f"index_name/?indextype={quote(indextype)}")
+    return result
+
+
+@app.get("/api/sws/industry-kline")
+async def get_sws_industry_kline(code: str, period: str = "DAY"):
+    """获取指定行业指数的日K线数据（全量历史，无分页）"""
+    path = f"index_publish/trend/?swindexcode={code}&period={period}"
+    result = _sws_api(path)
+    return result
+
+
+@app.get("/api/sws/industry-realtime")
+async def get_sws_industry_realtime(indextype: str = "一级行业"):
+    """获取所有行业的当日实时行情"""
+    from urllib.parse import quote
+    path = f"index_publish/current/?indextype={quote(indextype)}&page=1&page_size=100"
+    result = _sws_api(path)
+    return result
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)
