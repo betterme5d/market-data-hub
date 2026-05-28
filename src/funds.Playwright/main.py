@@ -196,30 +196,65 @@ SWS_BASE = "https://www.swsresearch.com/institute-sw/api"
 _sws_session_ok = False
 
 
-async def _ensure_sws_session():
-    """确保已访问申万首页建立 session（每次强制刷新，申万 session 寿命短）"""
+async def _ensure_sws_session(force_refresh: bool = False):
+    """确保已访问申万首页建立 session"""
     global _sws_session_ok
     page = browser_context["page"]
     if not page:
         raise HTTPException(status_code=500, detail="Browser is not initialized.")
 
     async with page_lock:
-        # 每次调用都重新建立 session（申万后端 session 寿命短，复用易 500）
-        logger.info("Establishing SWS session (fresh)...")
+        if force_refresh or not _sws_session_ok or "swsresearch.com" not in (page.url or ""):
+            logger.info("Establishing SWS session...")
+            try:
+                await page.goto(SWS_HOME, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(3)
+                _sws_session_ok = True
+                logger.info(f"SWS session OK")
+            except Exception as e:
+                logger.error(f"Failed to establish SWS session: {e}")
+                _sws_session_ok = False
+                raise HTTPException(status_code=502, detail=f"SWS session failed: {e}")
+
+
+@app.get("/sws/industry-kline-batch")
+async def sws_industry_kline_batch(start: str, end: str, codes: str = ""):
+    """
+    批量获取多个行业指数的日K线（一次 session，逐个 fetch，温和限速）
+    codes: 逗号分隔的行业代码，如 "801120,801150,801780"
+    """
+    await _ensure_sws_session(force_refresh=True)
+    page = browser_context["page"]
+
+    code_list = [c.strip() for c in codes.split(",") if c.strip()] if codes else []
+    if not code_list:
+        raise HTTPException(status_code=400, detail="codes parameter required")
+
+    results = {}
+    for i, code in enumerate(code_list):
+        if i > 0:
+            await asyncio.sleep(0.5)  # 每个请求间隔 0.5s，温和限速
+        api_url = (
+            f"{SWS_BASE}/index_analysis/index_analysis_report/"
+            f"?swindexcode={code}&start_date={start}&end_date={end}"
+            f"&index_type=一级行业&type=DA&page=1&page_size=5000"
+        )
         try:
-            await page.goto(
-                SWS_HOME,
-                wait_until="domcontentloaded",
-                timeout=30000,
-                # 忽略 SSL 证书错误
-            )
-            await asyncio.sleep(4)
-            _sws_session_ok = True
-            logger.info(f"SWS session OK, page URL: {page.url}")
+            raw_text = await page.evaluate(
+                """async (u) => {
+                    const r = await fetch(u, {headers: {
+                        'Accept': 'application/json, text/plain, */*',
+                        'Referer': 'https://www.swsresearch.com/',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    }});
+                    return await r.text();
+                }""", api_url)
+            results[code] = json.loads(raw_text.strip())
         except Exception as e:
-            logger.error(f"Failed to establish SWS session: {e}")
-            _sws_session_ok = False
-            raise HTTPException(status_code=502, detail=f"SWS session failed: {e}")
+            logger.error(f"Batch kline failed for {code}: {e}")
+            results[code] = {"error": str(e)}
+
+    return {"code": "200", "data": results}
 
 
 @app.get("/sws/industry-list")
