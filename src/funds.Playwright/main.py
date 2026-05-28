@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 
@@ -184,6 +185,130 @@ async def get_xueqiu_auth(ua: str = None):
             await browser.close()
             import gc
             gc.collect()
+
+
+# ============================================================
+# 申万行业指数数据端点 (swsresearch.com)
+# ============================================================
+
+SWS_HOME = "https://www.swsresearch.com/institute_sw/allIndex/releasedIndex"
+SWS_BASE = "https://www.swsresearch.com/institute-sw/api"
+_sws_session_ok = False
+
+
+async def _ensure_sws_session():
+    """确保已访问申万首页建立 session（每次强制刷新，申万 session 寿命短）"""
+    global _sws_session_ok
+    page = browser_context["page"]
+    if not page:
+        raise HTTPException(status_code=500, detail="Browser is not initialized.")
+
+    async with page_lock:
+        # 每次调用都重新建立 session（申万后端 session 寿命短，复用易 500）
+        logger.info("Establishing SWS session (fresh)...")
+        try:
+            await page.goto(
+                SWS_HOME,
+                wait_until="domcontentloaded",
+                timeout=30000,
+                # 忽略 SSL 证书错误
+            )
+            await asyncio.sleep(4)
+            _sws_session_ok = True
+            logger.info(f"SWS session OK, page URL: {page.url}")
+        except Exception as e:
+            logger.error(f"Failed to establish SWS session: {e}")
+            _sws_session_ok = False
+            raise HTTPException(status_code=502, detail=f"SWS session failed: {e}")
+
+
+@app.get("/sws/industry-list")
+async def sws_industry_list(indextype: str = "一级行业"):
+    """获取申万行业指数代码列表"""
+    await _ensure_sws_session()
+    page = browser_context["page"]
+    url = f"{SWS_BASE}/index_name/?indextype={indextype}"
+    try:
+        result = await page.evaluate(
+            """async (u) => {
+                const r = await fetch(u, {headers: {
+                    'Accept': 'application/json, text/plain, */*',
+                    'Referer': 'https://www.swsresearch.com/',
+                    'X-Requested-With': 'XMLHttpRequest'
+                }});
+                return await r.text();
+            }""", url)
+        return json.loads(result)
+    except Exception as e:
+        logger.error(f"SWS industry-list failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sws/industry-kline")
+async def sws_industry_kline(code: str, start: str, end: str, indextype: str = "一级行业"):
+    """获取指定行业指数的日K线数据（日期范围查询）"""
+    await _ensure_sws_session()
+    page = browser_context["page"]
+    url = (
+        f"{SWS_BASE}/index_analysis/index_analysis_report/"
+        f"?swindexcode={code}&start_date={start}&end_date={end}"
+        f"&index_type={indextype}&type=DA&page=1&page_size=5000"
+    )
+    try:
+        raw_text = await page.evaluate(
+            """async (u) => {
+                const r = await fetch(u, {headers: {
+                    'Accept': 'application/json, text/plain, */*',
+                    'Referer': 'https://www.swsresearch.com/',
+                    'X-Requested-With': 'XMLHttpRequest'
+                }});
+                return await r.text();
+            }""", url)
+        raw_text = raw_text.strip()
+        if not raw_text:
+            raise HTTPException(status_code=502, detail="SWS API returned empty response")
+        return json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        logger.error(f"SWS industry-kline JSON parse failed. Raw text[:500]: {raw_text[:500]}")
+        raise HTTPException(status_code=502, detail=f"JSON parse error: {e}. Raw: {raw_text[:200]}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"SWS industry-kline failed for {code}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sws/industry-realtime")
+async def sws_industry_realtime(indextype: str = "一级行业"):
+    """获取所有行业的当日实时行情（OHLCV, 用于盘中估值）"""
+    await _ensure_sws_session()
+    page = browser_context["page"]
+    url = (
+        f"{SWS_BASE}/index_publish/current/"
+        f"?indextype={indextype}&page=1&page_size=100"
+    )
+    try:
+        raw_text = await page.evaluate(
+            """async (u) => {
+                const r = await fetch(u, {headers: {
+                    'Accept': 'application/json, text/plain, */*',
+                    'Referer': 'https://www.swsresearch.com/',
+                    'X-Requested-With': 'XMLHttpRequest'
+                }});
+                return await r.text();
+            }""", url)
+        raw_text = raw_text.strip()
+        if not raw_text:
+            raise HTTPException(status_code=502, detail="SWS API returned empty response")
+        return json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        logger.error(f"SWS industry-realtime JSON parse failed. Raw text[:500]: {raw_text[:500]}")
+        raise HTTPException(status_code=502, detail=f"JSON parse error: {e}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"SWS industry-realtime failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/xueqiu/kline")
