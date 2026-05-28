@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query
 from typing import Optional
 import logging
+import httpx
 
 from core.models import UnifiedQuoteOut
 from core.cache import get_cached_quote, set_cached_quote
@@ -190,7 +191,6 @@ async def get_xueqiu_kline(
     """
     转发雪球K线获取请求到 Playwright 鉴权网关
     """
-    import httpx
     # 容器间网络域名为 funds.playwright.gateway，端口为 8081
     gateway_url = "http://funds.playwright.gateway:8081/xueqiu/kline"
     params = {
