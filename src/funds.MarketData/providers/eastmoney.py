@@ -377,3 +377,101 @@ class EastmoneyProvider:
         except Exception as e:
             logger.error(f"Failed to fetch fund info for {symbol}: {e}")
             return {"fund_code": symbol, "error": str(e)}
+
+    async def get_valuations(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        """
+        抓取、合并去重天天基金估值数据，仅返回以 16 和 5 开头的基金。
+        支持 3 分钟 Redis 缓存。
+        """
+        import time
+        import urllib.request
+        import urllib.parse
+        from datetime import datetime, timezone, timedelta
+        from core.cache import get_cached_valuations, set_cached_valuations
+        
+        # 1. 尝试缓存命中
+        if not force_refresh:
+            cached = get_cached_valuations()
+            if cached is not None:
+                return cached
+
+        loop = asyncio.get_event_loop()
+        
+        # 2. 获取 type=0 和 type=9 原始数据
+        # 使用 run_in_executor 避免阻塞 FastAPI 异步主循环
+        params_0 = {
+            "type": "0", "sort": "3", "orderType": "desc",
+            "canbuy": "0", "pageIndex": "1", "pageSize": "20000",
+            "callback": "", "_": str(int(time.time() * 1000))
+        }
+        params_9 = {
+            "type": "9", "sort": "3", "orderType": "desc",
+            "canbuy": "0", "pageIndex": "1", "pageSize": "20000",
+            "callback": "", "_": str(int(time.time() * 1000) + 1)
+        }
+
+        # 为了避免短时间内两个请求并发引起外部防爬封锁，引入 0.5s 的间隔
+        def fetch_sync(params):
+            url = f"https://api.fund.eastmoney.com/FundGuZhi/GetFundGZList?{urllib.parse.urlencode(params)}"
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Referer": "https://fund.eastmoney.com/",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                }
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=15) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except Exception as ex:
+                logger.error(f"Fetch Eastmoney list failed with params {params}: {ex}")
+                return {}
+
+        task_0 = loop.run_in_executor(None, fetch_sync, params_0)
+        await asyncio.sleep(0.5) # 串行延时，保护 IP 稳定性
+        task_9 = loop.run_in_executor(None, fetch_sync, params_9)
+
+        data_0, data_9 = await asyncio.gather(task_0, task_9)
+
+        list_0 = data_0.get("Data", {}).get("list", []) or []
+        list_9 = data_9.get("Data", {}).get("list", []) or []
+
+        # 3. 合并去重并筛选 16 和 5 开头的基金
+        merged = {}
+        for item in list_0 + list_9:
+            bzdm = item.get("bzdm")
+            if bzdm and (bzdm.startswith("16") or bzdm.startswith("5")):
+                merged[bzdm] = item
+
+        # 4. 数据清洗和标准化
+        fetched_at = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+        
+        def to_float(val) -> Optional[float]:
+            if not val or val in ("---", "-", None):
+                return None
+            try:
+                return float(str(val).replace("%", "").replace(",", "").strip())
+            except ValueError:
+                return None
+
+        result_list = []
+        for bzdm, item in merged.items():
+            est_val = to_float(item.get("gsz"))
+            if est_val is None:
+                continue
+
+            result_list.append({
+                "fund_code": bzdm,
+                "fund_name": item.get("jjjc"),
+                "fund_type": item.get("FType"),
+                "net_value": to_float(item.get("dwjz")),
+                "estimated_value": est_val,
+                "estimated_growth_rate": to_float(item.get("gszzl")),
+                "valuation_date": item.get("gzrq"),
+                "update_date": fetched_at # 抓取发生那一刻的时间
+            })
+
+        # 5. 写入 Redis 缓存 (3分钟过期)
+        set_cached_valuations(result_list, ttl=180)
+        return result_list
+

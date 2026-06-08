@@ -159,6 +159,18 @@ async def get_fund_info(symbol: str):
         logger.error(f"Get fund info failed for {symbol}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/eastmoney/valuations")
+async def get_eastmoney_valuations(force_refresh: bool = Query(False, description="是否强制刷新最新数据")):
+    """
+    获取去重合并并过滤后的以 16 或 5 开头的基金估值列表 (缓存 3 分钟)
+    """
+    try:
+        return await eastmoney_provider.get_valuations(force_refresh=force_refresh)
+    except Exception as e:
+        logger.error(f"Failed to get Eastmoney valuations: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 def clean_dataframe(df) -> list:
     import pandas as pd
     import datetime
