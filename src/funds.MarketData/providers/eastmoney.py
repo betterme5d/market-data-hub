@@ -436,11 +436,21 @@ class EastmoneyProvider:
         list_0 = data_0.get("Data", {}).get("list", []) or []
         list_9 = data_9.get("Data", {}).get("list", []) or []
 
-        # 3. 合并去重并筛选 16 和 5 开头的基金
+        # 3. 合并去重并筛选 16 和 5 开头的上市基金 (过滤掉非上市的场外联接基金和上交所场外老基金)
         merged = {}
         for item in list_0 + list_9:
             bzdm = item.get("bzdm")
+            jjjc = item.get("jjjc") or ""
             if bzdm and (bzdm.startswith("16") or bzdm.startswith("5")):
+                # 1. 过滤含有 "联接" 或 "连接" 且不含 "LOF" 的场外联接基金
+                if ("联接" in jjjc or "连接" in jjjc) and "LOF" not in jjjc:
+                    continue
+                # 2. 过滤含有 "ETF" 关键字，且不含 "LOF" 的基金 (防止过滤掉 ETF联接LOF 基金)
+                if "ETF" in jjjc.upper() and "LOF" not in jjjc.upper():
+                    continue
+                # 3. 过滤上交所场外老基金系列前缀 (519, 530, 540, 550 开头)
+                if bzdm.startswith("5") and bzdm.startswith(("519", "530", "540", "550")):
+                    continue
                 merged[bzdm] = item
 
         # 4. 数据清洗和标准化
