@@ -7,6 +7,8 @@ from core.models import UnifiedQuoteOut
 from core.cache import get_cached_quote, set_cached_quote
 from providers.yfinance import YFinanceProvider
 from providers.eastmoney import EastmoneyProvider
+from providers.kraneshares import KraneSharesProvider
+from providers.ishares import IsharesProvider
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -22,6 +24,8 @@ PROVIDERS = {
 }
 
 eastmoney_provider = EastmoneyProvider()
+krane_provider = KraneSharesProvider()
+ishares_provider = IsharesProvider()
 
 def route_provider(symbol: str, source: Optional[str] = None) -> str:
     """
@@ -38,6 +42,30 @@ def route_provider(symbol: str, source: Optional[str] = None) -> str:
 async def health():
     from core.cache import redis_client
     return {"status": "ok", "valkey": "connected" if redis_client else "disconnected"}
+
+@app.get("/api/krane/premium-discount/{pid}")
+async def get_krane_premium_discount(
+    pid: str,
+    start: str = Query(..., description="Start date YYYY-MM-DD"),
+    end: str = Query(..., description="End date YYYY-MM-DD")
+):
+    try:
+        return await krane_provider.get_premium_discount(pid, start, end)
+    except Exception as e:
+        logger.error(f"Get KraneShares premium discount failed for {pid}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/ishares/premium-discount/{product_path:path}")
+async def get_ishares_premium_discount(
+    product_path: str,
+    start: str = Query(..., description="Start date YYYY-MM-DD"),
+    end: str = Query(..., description="End date YYYY-MM-DD")
+):
+    try:
+        return await ishares_provider.get_premium_discount(product_path, start, end)
+    except Exception as e:
+        logger.error(f"Get iShares premium discount failed for {product_path}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/quote/{symbol}", response_model=UnifiedQuoteOut)
 async def get_quote(symbol: str, source: Optional[str] = None):
