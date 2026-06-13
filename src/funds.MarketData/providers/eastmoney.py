@@ -4,8 +4,12 @@ import logging
 import asyncio
 import requests
 import ssl
+import urllib3
 from bs4 import BeautifulSoup
 from typing import Dict, List, Any, Optional
+
+# 禁用未验证的 HTTPS 请求警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +27,13 @@ class EastmoneyProvider:
         同步获取 HTML，内部处理转义字符
         """
         try:
-            r = requests.get(self.url, params=params, headers=self.headers, timeout=10)
+            r = requests.get(
+                self.url,
+                params=params,
+                headers=self.headers,
+                timeout=10,
+                verify=False,
+            )
             if r.status_code != 200:
                 logger.warning(
                     f"Fetch Eastmoney holdings failed with status {r.status_code}"
