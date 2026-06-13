@@ -5,6 +5,7 @@ import json
 import urllib.request
 import urllib.parse
 import time
+import ssl
 
 # 将父目录加入 sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -47,7 +48,8 @@ async def get_raw_data_from_api():
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=15) as response:
+            context = ssl._create_unverified_context()
+            with urllib.request.urlopen(req, timeout=15, context=context) as response:
                 return json.loads(response.read().decode("utf-8"))
         except Exception as ex:
             print(f"请求失败 params={params}: {ex}")

@@ -3,6 +3,7 @@ import json
 import logging
 import asyncio
 import requests
+import ssl
 from bs4 import BeautifulSoup
 from typing import Dict, List, Any, Optional
 
@@ -448,7 +449,8 @@ class EastmoneyProvider:
                 },
             )
             try:
-                with urllib.request.urlopen(req, timeout=15) as response:
+                context = ssl._create_unverified_context()
+                with urllib.request.urlopen(req, timeout=15, context=context) as response:
                     return json.loads(response.read().decode("utf-8"))
             except Exception as ex:
                 logger.error(f"Fetch Eastmoney list failed with params {params}: {ex}")
