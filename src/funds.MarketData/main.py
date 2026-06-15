@@ -9,6 +9,7 @@ from providers.yfinance import YFinanceProvider
 from providers.eastmoney import EastmoneyProvider
 from providers.kraneshares import KraneSharesProvider
 from providers.ishares import IsharesProvider
+from providers.exchange_provider import ExchangeProvider
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +31,7 @@ PROVIDERS = {
 eastmoney_provider = EastmoneyProvider()
 krane_provider = KraneSharesProvider()
 ishares_provider = IsharesProvider()
+exchange_provider = ExchangeProvider()
 
 def route_provider(symbol: str, source: Optional[str] = None) -> str:
     """
@@ -213,6 +215,19 @@ async def get_eastmoney_valuations(
     except Exception as e:
         logger.error(f"Failed to get Eastmoney valuations: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/exchange/funds", tags=["基金数据"], summary="获取上交所和深交所ETF/LOF列表")
+async def get_exchange_funds():
+    """
+    抓取并解析上交所和深交所的最新 ETF 和 LOF 基金列表。
+    用于手动数据同步。
+    """
+    try:
+        return await exchange_provider.fetch_all_exchange_funds()
+    except Exception as e:
+        logger.error(f"Failed to get exchange funds: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 def clean_dataframe(df) -> list:
