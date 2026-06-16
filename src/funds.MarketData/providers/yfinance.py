@@ -10,7 +10,16 @@ from core.models import StockQuote
 from providers.base import BaseProvider
 from core.cache import get_cached_anchor, set_cached_anchor
 
+import requests
+
 logger = logging.getLogger(__name__)
+
+# 创建一个全局的 requests Session，并设置标准的浏览器 User-Agent
+# 这样可以强制 yfinance 使用标准的 requests 库，而不再使用容易在老系统崩溃的 curl_cffi
+_yf_session = requests.Session()
+_yf_session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+})
 
 def safe_float(val, default=0.0) -> float:
     try:
@@ -65,7 +74,7 @@ def get_market_ttl(fast_info) -> int:
 class YFinanceProvider(BaseProvider):
     async def get_quote(self, symbol: str) -> Tuple[StockQuote, int]:
         try:
-            ticker = yf.Ticker(symbol)
+            ticker = yf.Ticker(symbol, session=_yf_session)
             fast = ticker.fast_info
             
             # 获取基础价格 (安全防御：确保 NaN/None 变为 0)
@@ -124,7 +133,7 @@ class YFinanceProvider(BaseProvider):
     async def get_history(self, symbol: str, period: str, interval: str, 
                           start: Optional[str], end: Optional[str], adj: str) -> dict:
         try:
-            ticker = yf.Ticker(symbol)
+            ticker = yf.Ticker(symbol, session=_yf_session)
             if start and end:
                 hist = ticker.history(start=start, end=end, interval=interval, auto_adjust=False)
             else:
@@ -245,7 +254,7 @@ class YFinanceProvider(BaseProvider):
 
     async def get_info(self, symbol: str) -> dict:
         try:
-            return yf.Ticker(symbol).info
+            return yf.Ticker(symbol, session=_yf_session).info
         except Exception as e:
             logger.error(f"Error fetching info for {symbol} via yfinance: {str(e)}")
             raise e
