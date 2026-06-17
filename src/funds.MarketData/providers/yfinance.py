@@ -10,9 +10,34 @@ from core.models import StockQuote
 from providers.base import BaseProvider
 from core.cache import get_cached_anchor, set_cached_anchor
 
+import os
 import requests
+from urllib.parse import urlparse, urlunparse
+from requests.adapters import HTTPAdapter
 
 logger = logging.getLogger(__name__)
+
+# 自定义 HTTPAdapter，拦截发往 yahoo 的请求并重定向到 Cloudflare Worker
+class CFWorkerAdapter(HTTPAdapter):
+    def __init__(self, cf_worker_url, *args, **kwargs):
+        self.cf_worker_url = cf_worker_url.rstrip('/')
+        self.cf_worker_netloc = urlparse(self.cf_worker_url).netloc
+        super().__init__(*args, **kwargs)
+
+    def send(self, request, **kwargs):
+        parsed = urlparse(request.url)
+        # 如果是请求 yahoo，重写为发给 CF Worker
+        if parsed.netloc.endswith('yahoo.com'):
+            request.headers['X-Target-Host'] = parsed.netloc
+            request.url = urlunparse((
+                parsed.scheme,
+                self.cf_worker_netloc,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment
+            ))
+        return super().send(request, **kwargs)
 
 # 创建一个全局的 requests Session，并设置标准的浏览器 User-Agent
 # 这样可以强制 yfinance 使用标准的 requests 库，而不再使用容易在老系统崩溃的 curl_cffi
@@ -20,6 +45,14 @@ _yf_session = requests.Session()
 _yf_session.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 })
+
+# 如果配置了环境变量 YF_CF_WORKER_URL，则挂载 CF 代理适配器
+_cf_worker_url = os.getenv("YF_CF_WORKER_URL", "").strip()
+if _cf_worker_url:
+    _cf_adapter = CFWorkerAdapter(_cf_worker_url)
+    _yf_session.mount("https://", _cf_adapter)
+    _yf_session.mount("http://", _cf_adapter)
+    logger.info(f"Enabled Cloudflare Worker Proxy for yfinance: {_cf_worker_url}")
 
 def safe_float(val, default=0.0) -> float:
     try:
