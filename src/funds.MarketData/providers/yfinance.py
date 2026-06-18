@@ -48,11 +48,15 @@ _yf_session.headers.update({
 
 # 如果配置了环境变量 YF_CF_WORKER_URL，则挂载 CF 代理适配器
 _cf_worker_url = os.getenv("YF_CF_WORKER_URL", "").strip()
+_cf_worker_token = os.getenv("YF_CF_WORKER_TOKEN", "").strip()
+
 if _cf_worker_url:
     _cf_adapter = CFWorkerAdapter(_cf_worker_url)
     _yf_session.mount("https://", _cf_adapter)
     _yf_session.mount("http://", _cf_adapter)
-    logger.info(f"Enabled Cloudflare Worker Proxy for yfinance: {_cf_worker_url}")
+    if _cf_worker_token:
+        _yf_session.headers.update({'X-Proxy-Auth': _cf_worker_token})
+    logger.info(f"Enabled Cloudflare Worker Proxy for yfinance: {_cf_worker_url} (Auth: {'Yes' if _cf_worker_token else 'No'})")
 
 def safe_float(val, default=0.0) -> float:
     try:
