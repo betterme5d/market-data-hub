@@ -395,12 +395,83 @@ async def get_sws_industry_realtime(
     indextype: str = Query("一级行业", description="行业类别等级，如一级行业, 二级行业")
 ):
     """
-    抓取当日所有申万行业的盘中实时估值与涨跌幅排行数据。
+    抓取当日所有申万行业的盘中实时估值与涨跌幅排行数据（已转换为日K线类似格式）。
+    """
+    return await get_sws_bulk_industry_kline(indextype)
+
+
+@app.get("/api/sws/bulk-industry-kline", tags=["申万行业"], summary="获取指定等级下所有行业的当日K线数据(批量)")
+async def get_sws_bulk_industry_kline(
+    indextype: str = Query("一级行业", description="行业类别等级，如一级行业, 二级行业")
+):
+    """
+    批量抓取当日所有申万行业的估值行情，并从详情接口动态提取日期，拼接为标准K线格式返回。
     """
     from urllib.parse import quote
-    path = f"index_publish/current/?indextype={quote(indextype)}&page=1&page_size=100"
-    result = _sws_api(path)
-    return result
+    
+    # 1. 批量获取实时行情 (使用 page_size=200 以保证一次性获取完二级行业的 134 个指数)
+    path = f"index_publish/current/?indextype={quote(indextype)}&page=1&page_size=200"
+    try:
+        bulk_result = _sws_api(path)
+    except Exception as e:
+        logger.error(f"Failed to fetch bulk current data for {indextype}: {e}")
+        return {"code": "500", "message": f"获取批量数据失败: {str(e)}", "data": []}
+    
+    results = bulk_result.get("data", {}).get("results", [])
+    if not results:
+        return {"code": "200", "message": "ok", "data": []}
+    
+    # 2. 动态取出第一个指数的 code 来获取它的交易日期
+    first_code = results[0].get("swindexcode")
+    date_str = None
+    if first_code:
+        try:
+            date_path = f"index_publish/details/index_spread/?swindexcode={first_code}"
+            date_result = _sws_api(date_path)
+            if date_result.get("code") == "200" and date_result.get("data"):
+                raw_date = date_result["data"][0].get("trading_date")  # 格式如 "20260702"
+                if raw_date and len(raw_date) == 8:
+                    date_str = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}"
+        except Exception as e:
+            logger.error(f"Failed to fetch trading date for index {first_code}: {e}")
+            
+    # 3. 严格规则校验：如果日期获取失败，返回空数据且 code=500 (选项B)
+    if not date_str:
+        return {"code": "500", "message": "获取交易日期失败", "data": []}
+        
+    # 4. 组装并映射为类似日K线结构
+    data_list = []
+    for item in results:
+        try:
+            close_val = float(item.get("l3", 0))
+            open_val = float(item.get("l4", 0))
+            high_val = float(item.get("l6", 0))
+            low_val = float(item.get("l7", 0))
+            pre_close = float(item.get("l8", 0))
+            
+            # 计算 markup 涨跌幅 %
+            markup_val = round(((close_val - pre_close) / pre_close * 100), 2) if pre_close > 0 else 0.0
+            
+            data_list.append({
+                "swindexcode": item.get("swindexcode"),
+                "swindexname": item.get("swindexname"),
+                "bargaindate": date_str,
+                "openindex": open_val,
+                "maxindex": high_val,
+                "minindex": low_val,
+                "closeindex": close_val,
+                "markup": markup_val,
+                "bargainamount": float(item.get("l5", 0)) / 100.0,
+                "bargainsum": float(item.get("l11", 0)) / 100.0
+            })
+        except Exception as ex:
+            logger.warning(f"Error parsing bulk item {item}: {ex}")
+            
+    return {
+        "code": "200",
+        "message": "ok",
+        "data": data_list
+    }
 
 
 if __name__ == "__main__":
