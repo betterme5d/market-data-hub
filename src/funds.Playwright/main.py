@@ -56,6 +56,7 @@ async def lifespan(app: FastAPI):
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
+            ignore_https_errors=True,
         )
         page = await context.new_page()
         await Stealth().apply_stealth_async(page)
@@ -123,6 +124,7 @@ async def get_xueqiu_auth(ua: str = None):
         context = await browser.new_context(
             user_agent=target_ua,
             viewport={"width": 1920, "height": 1080},
+            ignore_https_errors=True,
             extra_http_headers={
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",

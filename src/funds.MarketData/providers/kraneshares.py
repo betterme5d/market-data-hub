@@ -15,7 +15,7 @@ class KraneSharesProvider:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(verify=False) as client:
             resp = await client.get(url, headers=headers, timeout=20.0)
             if resp.status_code != 200:
                 logger.error(f"Failed to fetch KraneShares data, status: {resp.status_code}")

@@ -4,9 +4,9 @@ from core.models import UnifiedQuoteOut
 
 class BaseProvider(ABC):
     @abstractmethod
-    async def get_quote(self, symbol: str) -> Tuple[UnifiedQuoteOut, int]:
+    async def get_quote(self, symbol: str, with_depth: bool = False) -> Tuple[UnifiedQuoteOut, int]:
         """
-        获取实时行情数据
+        获取实时行情数据，包含可选的盘口深度
         返回: (QuoteModel, CacheTTLSeconds)
         """
         pass

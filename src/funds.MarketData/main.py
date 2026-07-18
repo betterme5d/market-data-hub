@@ -1,19 +1,39 @@
 from fastapi import FastAPI, HTTPException, Query, Path
-from typing import Optional
+from typing import Optional, Dict, List
+from pydantic import BaseModel
 import logging
 import httpx
 
 from core.models import UnifiedQuoteOut
 from core.cache import get_cached_quote, set_cached_quote
+from core.dispatcher import QuoteDispatcher
 from providers.yfinance import YFinanceProvider
+from providers.sina import SinaProvider
+from providers.tencent import TencentProvider
+from providers.xueqiu import XueqiuProvider
 from providers.eastmoney import EastmoneyProvider
 from providers.kraneshares import KraneSharesProvider
 from providers.ishares import IsharesProvider
 from providers.exchange_provider import ExchangeProvider
+from core.exceptions import BusinessException
 
 # 配置日志
-logging.basicConfig(level=logging.INFO)
+import os
+DEBUG_MODE = os.getenv("DEBUG", "false").lower() == "true"
+LOG_LEVEL = logging.DEBUG if DEBUG_MODE else logging.INFO
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
 logger = logging.getLogger(__name__)
+
+# 调试模式下强开底层包的 DEBUG 级日志
+if DEBUG_MODE:
+    logging.getLogger("providers").setLevel(logging.DEBUG)
+    logging.getLogger("core").setLevel(logging.DEBUG)
+    logging.getLogger("httpx").setLevel(logging.DEBUG)
+    logger.info("Debug mode enabled. Full execution logs are active.")
 
 app = FastAPI(
     title="Market Data Proxy Service",
@@ -23,9 +43,15 @@ app = FastAPI(
 
 # 实例化提供商
 yfinance_provider = YFinanceProvider()
+sina_provider = SinaProvider()
+tencent_provider = TencentProvider()
+xueqiu_provider = XueqiuProvider()
 
 PROVIDERS = {
-    "yfinance": yfinance_provider
+    "yfinance": yfinance_provider,
+    "sina": sina_provider,
+    "tencent": tencent_provider,
+    "xueqiu": xueqiu_provider
 }
 
 eastmoney_provider = EastmoneyProvider()
@@ -36,12 +62,15 @@ exchange_provider = ExchangeProvider()
 def route_provider(symbol: str, source: Optional[str] = None) -> str:
     """
     根据标的代码特征或显式参数选择行情提供商。
-    未来可以方便地扩展：
-    if symbol.endswith(".SH") or symbol.endswith(".SZ"):
-        return "tushare"
     """
-    if source and source in PROVIDERS:
-        return source
+    if source and source.lower() in PROVIDERS:
+        return source.lower()
+        
+    symbol_lower = symbol.lower()
+    if symbol_lower.startswith(("nf_", "hf_")):
+        return "sina"
+    elif symbol_lower.endswith((".sh", ".sz")) or symbol_lower.startswith(("sh", "sz")):
+        return "xueqiu"
     return "yfinance"
 
 @app.get("/health", tags=["系统监控"], summary="服务健康检查")
@@ -51,6 +80,34 @@ async def health():
     """
     from core.cache import redis_client
     return {"status": "ok", "valkey": "connected" if redis_client else "disconnected"}
+
+@app.get("/api/sources/status", tags=["系统监控"], summary="获取各行情源实时健康状态与熔断指标")
+async def get_sources_status():
+    """
+    暴露所有已注册行情数据源的实时熔断状态、失败故障计数及隔离剩余秒数。
+    """
+    sources = list(PROVIDERS.keys())
+    status_list = []
+    for src in sources:
+        metrics = QuoteDispatcher.get_source_metrics(src)
+        status_list.append(metrics)
+    return status_list
+
+@app.post("/api/sources/unblock", tags=["系统监控"], summary="手动重新启用（解封）指定行情数据源")
+async def unblock_source(
+    source: str = Query(..., description="要解封的行情源，如 sina, tencent, xueqiu, yfinance")
+):
+    """
+    手动清除指定行情源在 Valkey 中的熔断冷却与失败计次，强制其立即重新启用。
+    """
+    source_lower = source.lower()
+    if source_lower not in PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"Source provider {source} not found")
+        
+    success = QuoteDispatcher.unblock_source(source_lower)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to unblock source")
+    return {"status": "ok", "message": f"Source {source_lower} has been successfully unblocked"}
 
 @app.get("/api/krane/premium-discount/{pid}", tags=["折溢价率"], summary="获取 KraneShares 基金折溢价率")
 async def get_krane_premium_discount(
@@ -82,35 +139,115 @@ async def get_ishares_premium_discount(
         logger.error(f"Get iShares premium discount failed for {product_path}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+def translate_standard_symbol(symbol: str) -> Dict[str, str]:
+    """
+    根据标的特征翻译为数据源的标准代码。
+    例如：
+      - 510300.SH -> {"tencent": "sh510300", "sina": "sh510300", "xueqiu": "SH510300"}
+      - 00700.HK -> {"tencent": "hk00700", "sina": "rt_hk00700", "xueqiu": "00700"}
+      - AAPL -> {"yfinance": "AAPL", "xueqiu": "AAPL", "sina": "gb_aapl"}
+    """
+    symbol_upper = symbol.upper()
+    
+    # 1. 新浪/腾讯/雪球专有格式
+    if symbol.lower().startswith(("sh", "sz", "hk", "rt_hk", "gb_", "nf_", "hf_", "fx_", "znb_")):
+        s = symbol.lower()
+        if s.startswith("rt_hk"):
+            return {"sina": s, "xueqiu": s[5:]}
+        elif s.startswith("gb_"):
+            return {"sina": s, "yfinance": s[3:].upper(), "xueqiu": s[3:].upper()}
+        elif s.startswith("nf_") or s.startswith("hf_"):
+            return {"sina": s}
+        elif s.startswith("fx_"):
+            return {"xueqiu": s.upper()}
+        elif s.startswith("sh") or s.startswith("sz"):
+            return {"tencent": s, "sina": s, "xueqiu": s.upper()}
+        return {"sina": s}
+
+    # 2. 带有后缀的标准化格式 (510300.SH, 000001.SZ, 00700.HK 等)
+    if "." in symbol_upper:
+        code, suffix = symbol_upper.split('.', 1)
+        if suffix in ["SH", "SS"]:
+            return {
+                "tencent": f"sh{code}",
+                "sina": f"sh{code}",
+                "xueqiu": f"SH{code}"
+            }
+        elif suffix == "SZ":
+            return {
+                "tencent": f"sz{code}",
+                "sina": f"sz{code}",
+                "xueqiu": f"SZ{code}"
+            }
+        elif suffix == "HK":
+            padded_code = code.zfill(5)
+            return {
+                "tencent": f"hk{padded_code}",
+                "sina": f"rt_hk{padded_code}",
+                "xueqiu": padded_code
+            }
+
+    # 3. 常见美股标的代码 (2-5位英文字母)
+    if symbol_upper.isalpha() and 2 <= len(symbol_upper) <= 5:
+        return {
+            "yfinance": symbol_upper,
+            "xueqiu": symbol_upper,
+            "sina": f"gb_{symbol.lower()}",
+            "tencent": f"us{symbol_upper}"
+        }
+
+    # 4. 透传做为兜底
+    return {"yfinance": symbol, "xueqiu": symbol_upper, "sina": symbol.lower()}
+
+class BatchQuoteItem(BaseModel):
+    symbol: str
+    allowed_sources: Dict[str, str]
+
+class BatchQuoteRequest(BaseModel):
+    items: List[BatchQuoteItem]
+
+@app.post("/quote/batch", response_model=List[UnifiedQuoteOut], tags=["行情数据"], summary="批量获取实时行情")
+async def get_quotes_batch(request: BatchQuoteRequest, with_depth: bool = Query(False, description="是否包含五档深度盘口数据")):
+    """
+    批量获取多个证券的最新实时报价。
+    C#端通过此接口发送包含每个标的可用源映射的字典。
+    """
+    try:
+        items_dict = [{"symbol": item.symbol, "allowed_sources": item.allowed_sources} for item in request.items]
+        results = await QuoteDispatcher.get_quotes_batch(items_dict, with_depth=with_depth)
+        return results
+    except Exception as e:
+        logger.error(f"Batch quote fetch failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/quote/{symbol}", response_model=UnifiedQuoteOut, tags=["行情数据"], summary="获取实时行情")
 async def get_quote(
     symbol: str = Path(..., description="标的代码，例如 AAPL 或 000001.SZ"), 
-    source: Optional[str] = Query(None, description="行情提供商（如 yfinance），不填则自动路由")
+    source: Optional[str] = Query(None, description="强制行情提供商（如 tencent, sina, xueqiu, yfinance），不填则自动多源 Fallback"),
+    with_depth: bool = Query(False, description="是否包含五档深度盘口数据")
 ):
     """
-    获取股票或 ETF 的最新实时报价，优先从 Valkey 缓存读取，未命中则调用底端接口并缓存。
+    获取单个股票或 ETF 的最新实时报价，支持自动代码翻译与多源自适应熔断 Fallback。
     """
-    provider_name = route_provider(symbol, source)
-    
-    # 1. 尝试优先从缓存读取
-    cached_data = get_cached_quote(symbol, provider=provider_name)
-    if cached_data:
-        return cached_data
-
-    # 2. 缓存未命中，调用提供商获取
-    provider = PROVIDERS.get(provider_name)
-    if not provider:
-        raise HTTPException(status_code=400, detail=f"Provider {provider_name} not found")
-    
-    try:
-        result_model, ttl = await provider.get_quote(symbol)
+    if source:
+        source_lower = source.lower()
+        translated = translate_standard_symbol(symbol)
+        if source_lower in translated:
+            allowed_sources = {source_lower: translated[source_lower]}
+        else:
+            allowed_sources = {source_lower: symbol}
+    else:
+        allowed_sources = translate_standard_symbol(symbol)
         
-        # 3. 写入缓存并返回
-        set_cached_quote(symbol, result_model.model_dump(), ttl, provider=provider_name)
-        return result_model
+    try:
+        result = await QuoteDispatcher.get_quote_with_fallback(symbol, allowed_sources, with_depth=with_depth)
+        return result
+    except BusinessException as be:
+        raise HTTPException(status_code=400, detail=str(be))
     except Exception as e:
-        logger.error(f"Get quote failed for {symbol} via {provider_name}: {e}")
+        logger.error(f"Get quote failed for {symbol}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/history/{symbol}", tags=["行情数据"], summary="获取历史 K 线")
 async def get_history(
@@ -132,6 +269,8 @@ async def get_history(
 
     try:
         return await provider.get_history(symbol, period, interval, start, end, adj)
+    except BusinessException as be:
+        raise HTTPException(status_code=400, detail=str(be))
     except Exception as e:
         logger.error(f"Get history failed for {symbol} via {provider_name}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -472,6 +611,23 @@ async def get_sws_bulk_industry_kline(
         "message": "ok",
         "data": data_list
     }
+
+
+@app.get("/quote/unblock-all", tags=["调试与维护"], summary="一键清除所有数据源的熔断状态")
+async def unblock_all_sources():
+    if not redis_client:
+        return {"status": "error", "message": "Valkey/Redis 缓存未连接"}
+    try:
+        from core.dispatcher import get_blocked_key
+        cleared = []
+        for src in ["tencent", "sina", "xueqiu", "yfinance"]:
+            key = get_blocked_key(src)
+            res = redis_client.delete(key)
+            if res > 0:
+                cleared.append(src)
+        return {"status": "ok", "cleared_sources": cleared}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":

@@ -17,12 +17,14 @@ class IsharesProvider:
         )
 
     async def get_premium_discount(self, product_path: str, start: str, end: str) -> Dict[str, float]:
-        url = f"{self.base_url}{product_path}"
+        # 清洗 product_path，剥离可能包含的 Query 参数（例如 ?tab=... 或 %3Ftab=...）
+        clean_path = product_path.split('?')[0].split('%3F')[0]
+        url = f"{self.base_url.rstrip('/')}/{clean_path.lstrip('/')}?tab=premium-discount-chart"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(verify=False) as client:
             resp = await client.get(url, headers=headers, timeout=20.0)
             if resp.status_code != 200:
                 logger.error(f"Failed to fetch iShares data, status: {resp.status_code}")

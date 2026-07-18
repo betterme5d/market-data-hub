@@ -6,9 +6,11 @@ import yfinance as yf
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
-from core.models import StockQuote
+from core.models import UnifiedQuote
 from providers.base import BaseProvider
 from core.cache import get_cached_anchor, set_cached_anchor
+from core.exceptions import BusinessException
+
 
 import os
 import requests
@@ -42,6 +44,9 @@ class CFWorkerAdapter(HTTPAdapter):
 # 创建一个全局的 requests Session，并设置标准的浏览器 User-Agent
 # 这样可以强制 yfinance 使用标准的 requests 库，而不再使用容易在老系统崩溃的 curl_cffi
 _yf_session = requests.Session()
+_yf_session.verify = False
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 _yf_session.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 })
@@ -109,7 +114,7 @@ def get_market_ttl(fast_info) -> int:
         return 600
 
 class YFinanceProvider(BaseProvider):
-    async def get_quote(self, symbol: str) -> Tuple[StockQuote, int]:
+    async def get_quote(self, symbol: str, with_depth: bool = False) -> Tuple[UnifiedQuote, int]:
         try:
             ticker = yf.Ticker(symbol, session=_yf_session)
             fast = ticker.fast_info
@@ -135,20 +140,20 @@ class YFinanceProvider(BaseProvider):
 
             # 涨跌计算
             change = price - last_close
-            percent = (change / last_close * 100) if last_close != 0 else 0
+            percent = (change / last_close * 100.0) if last_close != 0 else 0
             
             # 安全转换 Volume
             raw_vol = getattr(fast, 'last_volume', 0)
-            volume = int(safe_float(raw_vol))
+            volume = float(safe_float(raw_vol))
 
-            result = StockQuote(
+            result = UnifiedQuote(
                 symbol=symbol,
                 name=symbol,
                 date=price_date,
                 price=round(price, 4),
-                lastClose=round(last_close, 4),
+                last_close=round(last_close, 4),
                 change=round(change, 4),
-                percent=round(percent, 4),
+                percent=round(percent, 6),
                 open=round(open_val, 4),
                 high=round(high_val, 4),
                 low=round(low_val, 4),
@@ -156,15 +161,19 @@ class YFinanceProvider(BaseProvider):
                 amount=round(float(volume) * float(price), 2),
                 currency=getattr(fast, 'currency', None),
                 exchange=getattr(fast, 'exchange', None),
-                timestamp=datetime.now().isoformat(),
-                security_type="stock"
+                timestamp=datetime.utcnow().isoformat(),
+                security_type="stock",
+                source="yfinance"
             )
 
             ttl = get_market_ttl(fast)
             return result, ttl
 
         except Exception as e:
-            logger.error(f"Error fetching quote for {symbol} via yfinance: {str(e)}")
+            err_msg = str(e)
+            if "No data found" in err_msg or "not found" in err_msg or "invalid" in err_msg:
+                raise BusinessException(f"YahooFinance returned empty result for symbol {symbol} due to code invalidity: {err_msg}")
+            logger.error(f"Error fetching quote for {symbol} via yfinance: {err_msg}")
             raise e
 
     async def get_history(self, symbol: str, period: str, interval: str, 
