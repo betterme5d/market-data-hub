@@ -262,99 +262,109 @@ class QuoteDispatcher:
             # 全部命中缓存，直接按输入顺序排序输出
             return [results_map[item["symbol"].lower()] for item in items if item["symbol"].lower() in results_map]
 
-        # 3. 开始多轮批量抓取调度，直到所有 pending 都被解决或无可用源
-        round_num = 1
-        while pending_items and round_num <= 3:
-            logger.info(f"Batch Dispatch Round {round_num}: Pending count={len(pending_items)}")
-            
-            source_groups: Dict[str, List[Tuple[Dict[str, Any], str]]] = {}
-            unsupported_items = []
-
-            for item in pending_items:
-                allowed_sources = item.get("allowed_sources", {})
+        # 3. 分片串行抓取以防高并发
+        MAX_CHUNK_SIZE = 800
+        pending_chunks = [pending_items[i:i + MAX_CHUNK_SIZE] for i in range(0, len(pending_items), MAX_CHUNK_SIZE)]
+        
+        for chunk in pending_chunks:
+            current_pending = chunk.copy()
+            round_num = 1
+            while current_pending and round_num <= 3:
+                logger.info(f"Batch Dispatch Round {round_num}: Pending count={len(current_pending)} in chunk of size {len(chunk)}")
                 
-                # 寻找该标的允许的、未熔断的、优先级最高的源
-                allocated = False
-                for src, src_symbol in allowed_sources.items():
-                    src = src.lower()
-                    if src in PROVIDERS and not QuoteDispatcher.is_source_blocked(src):
-                        source_groups.setdefault(src, []).append((item, src_symbol))
-                        allocated = True
-                        break
-                
-                if not allocated:
-                    unsupported_items.append(item)
+                source_groups: Dict[str, List[Tuple[Dict[str, Any], str]]] = {}
+                unsupported_items = []
 
-            if not source_groups:
-                logger.warning("No unblocked allowed sources found for remaining pending items.")
-                break
-
-            # 并发执行各组的批量抓取
-            async def fetch_group(source: str, group_list: List[Tuple[Dict[str, Any], str]]) -> Dict[str, UnifiedQuote]:
-                provider = PROVIDERS[source]
-                sem = SEMAPHORES[source]
-                
-                symbol_mapping = {src_symbol.lower(): item["symbol"] for item, src_symbol in group_list}
-                fetch_symbols = list(symbol_mapping.keys())
-                
-                async with sem:
-                    try:
-                        logger.info(f"Group batch fetching {len(fetch_symbols)} symbols via '{source}' (with_depth={with_depth})")
-                        
-                        if hasattr(provider, "get_quotes"):
-                            batch_results = await provider.get_quotes(fetch_symbols, with_depth=with_depth)
-                        else:
-                            async def fetch_single(single_symbol: str) -> Optional[UnifiedQuote]:
-                                try:
-                                    q, _ = await provider.get_quote(single_symbol, with_depth=with_depth)
-                                    return q
-                                except Exception:
-                                    return None
-                            
-                            tasks = [fetch_single(s) for s in fetch_symbols]
-                            singles = await asyncio.gather(*tasks)
-                            batch_results = {s: q for s, q in zip(fetch_symbols, singles) if q}
-                        
-                        processed_results = {}
-                        for src_sym, q in batch_results.items():
-                            std_symbol = symbol_mapping.get(src_sym.lower())
-                            if std_symbol:
-                                q.symbol = std_symbol
-                                processed_results[std_symbol.lower()] = q
-                        
-                        # 抓取成功，重置失败计数
-                        QuoteDispatcher.reset_failures(source)
-                        return processed_results
-                    except BusinessException as bex:
-                        logger.warning(f"Batch fetch business query error via '{source}': {bex}")
-                        return {}
-                    except Exception as ex:
-                        logger.error(f"Batch fetch failed via '{source}': {ex}")
-                        # 递增失败计数器，达到阈值才熔断
-                        QuoteDispatcher.record_failure(source)
-                        return {}
-
-            tasks = [fetch_group(src, g_list) for src, g_list in source_groups.items()]
-            group_results_list = await asyncio.gather(*tasks)
-            
-            round_success_count = 0
-            for group_res in group_results_list:
-                for std_sym, q in group_res.items():
-                    results_map[std_sym] = q
-                    round_success_count += 1
+                for item in current_pending:
+                    allowed_sources = item.get("allowed_sources", {})
                     
-                    # 仅在不带深度数据时写入 Redis 缓存
-                    if not with_depth and redis_client:
-                        try:
-                            redis_client.setex(get_quote_cache_key(std_sym), DEFAULT_CACHE_TTL, q.model_dump_json())
-                            logger.debug(f"Successfully cached batch quote for {std_sym} to Valkey, ttl={DEFAULT_CACHE_TTL}")
-                        except Exception:
-                            pass
+                    # 寻找该标的允许的、未熔断的、优先级最高的源
+                    allocated = False
+                    for src, src_symbol in allowed_sources.items():
+                        src = src.lower()
+                        if src in PROVIDERS and not QuoteDispatcher.is_source_blocked(src):
+                            source_groups.setdefault(src, []).append((item, src_symbol))
+                            allocated = True
+                            break
+                    
+                    if not allocated:
+                        unsupported_items.append(item)
 
-            logger.info(f"Round {round_num} finished, successfully retrieved {round_success_count} quotes.")
-            
-            pending_items = [item for item in items if item["symbol"].lower() not in results_map]
-            round_num += 1
+                if not source_groups:
+                    logger.warning("No unblocked allowed sources found for remaining pending items.")
+                    break
+
+                # 并发执行各组的批量抓取
+                async def fetch_group(source: str, group_list: List[Tuple[Dict[str, Any], str]]) -> Dict[str, UnifiedQuote]:
+                    provider = PROVIDERS[source]
+                    sem = SEMAPHORES[source]
+                    
+                    symbol_mapping = {}
+                    for item, src_symbol in group_list:
+                        symbol_mapping.setdefault(src_symbol.lower(), []).append(item["symbol"])
+                    fetch_symbols = list(symbol_mapping.keys())
+                    
+                    async with sem:
+                        try:
+                            logger.info(f"Group batch fetching {len(fetch_symbols)} symbols via '{source}' (with_depth={with_depth})")
+                            
+                            if hasattr(provider, "get_quotes"):
+                                batch_results = await provider.get_quotes(fetch_symbols, with_depth=with_depth)
+                            else:
+                                async def fetch_single(single_symbol: str) -> Optional[UnifiedQuote]:
+                                    try:
+                                        q, _ = await provider.get_quote(single_symbol, with_depth=with_depth)
+                                        return q
+                                    except Exception:
+                                        return None
+                                
+                                tasks = [fetch_single(s) for s in fetch_symbols]
+                                singles = await asyncio.gather(*tasks)
+                                batch_results = {s: q for s, q in zip(fetch_symbols, singles) if q}
+                            
+                            processed_results = {}
+                            import copy
+                            for src_sym, q in batch_results.items():
+                                std_symbols = symbol_mapping.get(src_sym.lower())
+                                if std_symbols:
+                                    for std_symbol in std_symbols:
+                                        q_copy = copy.copy(q)
+                                        q_copy.symbol = std_symbol
+                                        processed_results[std_symbol.lower()] = q_copy
+                            
+                            # 抓取成功，重置失败计数
+                            QuoteDispatcher.reset_failures(source)
+                            return processed_results
+                        except BusinessException as bex:
+                            logger.warning(f"Batch fetch business query error via '{source}': {bex}")
+                            return {}
+                        except Exception as ex:
+                            logger.error(f"Batch fetch failed via '{source}': {ex}")
+                            # 递增失败计数器，达到阈值才熔断
+                            QuoteDispatcher.record_failure(source)
+                            return {}
+
+                tasks = [fetch_group(src, g_list) for src, g_list in source_groups.items()]
+                group_results_list = await asyncio.gather(*tasks)
+                
+                round_success_count = 0
+                for group_res in group_results_list:
+                    for std_sym, q in group_res.items():
+                        results_map[std_sym] = q
+                        round_success_count += 1
+                        
+                        # 仅在不带深度数据时写入 Redis 缓存
+                        if not with_depth and redis_client:
+                            try:
+                                redis_client.setex(get_quote_cache_key(std_sym), DEFAULT_CACHE_TTL, q.model_dump_json())
+                                logger.debug(f"Successfully cached batch quote for {std_sym} to Valkey, ttl={DEFAULT_CACHE_TTL}")
+                            except Exception:
+                                pass
+
+                logger.info(f"Round {round_num} finished, successfully retrieved {round_success_count} quotes.")
+                
+                current_pending = [item for item in current_pending if item["symbol"].lower() not in results_map]
+                round_num += 1
 
         final_list = []
         for item in items:

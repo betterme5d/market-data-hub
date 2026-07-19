@@ -27,14 +27,31 @@ async def test_tencent_provider():
     try:
         # 测试沪深A股/ETF
         q, ttl = await provider.get_quote("sh510300")
-        print(f"腾讯 [sh510300] 行情抓取成功: {q.name}, 价格={q.price}, 昨收={q.last_close}, 涨跌幅={q.percent}, 时间={q.update_time}")
+        print(f"腾讯 [sh510300] 行情抓取成功: {q.name}, 价格={q.price}, 昨收={q.last_close}, 涨跌幅={q.percent}, 币种={q.currency}, 时间={q.update_time}")
         assert q.price > 0
         assert q.last_close > 0
+        assert q.currency == "CNY"
+        
+        # 测试港股
+        q_hk, _ = await provider.get_quote("hk00700")
+        print(f"腾讯港股 [hk00700] 行情抓取成功: {q_hk.name}, 价格={q_hk.price}, 昨收={q_hk.last_close}, 涨跌幅={q_hk.percent}, 币种={q_hk.currency}, 成交额={q_hk.amount}, 时间={q_hk.update_time}")
+        assert q_hk.price > 0
+        assert q_hk.last_close > 0
+        assert q_hk.currency == "HKD"
+        assert q_hk.amount > 0
+        
+        # 测试美股
+        q_us, _ = await provider.get_quote("usAAPL")
+        print(f"腾讯美股 [usAAPL] 行情抓取成功: {q_us.name}, 价格={q_us.price}, 昨收={q_us.last_close}, 涨跌幅={q_us.percent}, 币种={q_us.currency}, 成交额={q_us.amount}, 时间={q_us.update_time}")
+        assert q_us.price > 0
+        assert q_us.last_close > 0
+        assert q_us.currency == "USD"
+        assert q_us.amount > 0
         
         # 测试批量
-        res = await provider.get_quotes(["sh510300", "sz159915"])
+        res = await provider.get_quotes(["sh510300", "sz159915", "hk00700", "usAAPL"])
         print(f"腾讯批量获取成功，返回数量={len(res)}")
-        assert "sh510300" in res and "sz159915" in res
+        assert "sh510300" in res and "sz159915" in res and "hk00700" in res and "usaapl" in res
     except Exception as e:
         print(f"腾讯行情测试失败: {e}")
     print()
@@ -249,6 +266,31 @@ async def test_manual_unblock():
     print("  -> 成功！yfinance 数据源已被成功手动解封恢复正常状态。")
     print()
 
+async def test_large_batch_chunking():
+    print("=== [11] 测试大批量切片与串行请求 ===")
+    
+    # 构造 805 个待抓取项以触发超出 800 分片
+    # 伪造不同的 symbol 以确保绕过缓存进入 pending 抓取，但实际 mapping 指向同一个正确的股票以确保成功抓取
+    items = []
+    for i in range(805):
+        items.append({
+            "symbol": f"510300_{i}",
+            "allowed_sources": {"tencent": "sh510300"}
+        })
+        
+    try:
+        results = await QuoteDispatcher.get_quotes_batch(items)
+        print(f"  大批量切片抓取测试成功，返回数量={len(results)}")
+        assert len(results) == 805
+        print(f"  首只股票: {results[0].symbol} -> 价格={results[0].price}")
+        print(f"  末只股票: {results[-1].symbol} -> 价格={results[-1].price}")
+        assert results[0].price > 0
+        assert results[-1].price > 0
+    except Exception as e:
+        print(f"  大批量分片测试失败: {e}")
+        assert False
+    print()
+
 async def main():
     print("开始运行统一行情服务集成测试...\n")
     await test_symbol_translation()
@@ -261,6 +303,7 @@ async def main():
     await test_circuit_breaker_immunity()
     await test_sources_status()
     await test_manual_unblock()
+    await test_large_batch_chunking()
     print("全部集成测试流程结束。")
 
 if __name__ == "__main__":
