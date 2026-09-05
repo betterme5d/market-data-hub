@@ -80,3 +80,36 @@ def is_exchange_traded_fund(fund_code: str) -> bool:
     判断基金代码是否是可以在交易所进行交易的场内基金。
     """
     return get_fund_exchange_type(fund_code) is not None
+
+
+def clean_dataframe(df) -> list:
+    """
+    将 akshare 返回的 DataFrame 清洗为可 JSON 序列化的记录列表：
+    仅保留场内基金，NaN→None，日期转字符串，基金代码补零。
+    """
+    import datetime
+
+    import pandas as pd
+
+    # 先做一层交易所交易基金的过滤，仅保留场内交易基金
+    df['temp_code'] = df['基金代码'].astype(str).str.zfill(6)
+    df = df[df['temp_code'].apply(is_exchange_traded_fund)]
+    df = df.drop(columns=['temp_code'])
+
+    records = df.to_dict(orient="records")
+    cleaned_records = []
+    for r in records:
+        cleaned_r = {}
+        for k, v in r.items():
+            if pd.isna(v):
+                cleaned_r[k] = None
+            else:
+                if isinstance(v, (pd.Timestamp, datetime.date, datetime.datetime)):
+                    cleaned_r[k] = v.strftime("%Y-%m-%d")
+                else:
+                    if k == "基金代码":
+                        cleaned_r[k] = str(v).zfill(6)
+                    else:
+                        cleaned_r[k] = v
+        cleaned_records.append(cleaned_r)
+    return cleaned_records

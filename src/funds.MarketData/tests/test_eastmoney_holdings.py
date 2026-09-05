@@ -2,10 +2,13 @@ import asyncio
 import os
 import sys
 import json
+import pytest
+
+pytestmark = pytest.mark.integration  # 需要真实外部网络，默认跳过
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from providers.eastmoney import EastmoneyProvider
+from providers.funds.eastmoney import EastmoneyProvider
 
 def find_col_indices(headers, is_bond=False):
     indices = {}

@@ -7,10 +7,11 @@ from core.exceptions import BusinessException
 
 from core.models import UnifiedQuote
 from core.cache import redis_client
-from providers.tencent import TencentProvider
-from providers.sina import SinaProvider
-from providers.xueqiu import XueqiuProvider
-from providers.yfinance import YFinanceProvider
+from core import health
+from providers.quotes.tencent import TencentProvider
+from providers.quotes.sina import SinaProvider
+from providers.quotes.xueqiu import XueqiuProvider
+from providers.quotes.yfinance import YFinanceProvider
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +197,7 @@ class QuoteDispatcher:
 
             sem = SEMAPHORES.get(source) or asyncio.Semaphore(5)
             async with sem:
+                started = time.monotonic()
                 try:
                     logger.info(f"Fetching '{symbol}' via '{source}' using symbol '{source_symbol}' (with_depth={with_depth})")
                     result_model, ttl = await provider.get_quote(source_symbol, with_depth=with_depth)
@@ -213,11 +215,15 @@ class QuoteDispatcher:
                     
                     # 成功抓取，重置该源的失败计数器
                     QuoteDispatcher.reset_failures(source)
+                    health.record_call(source, True, (time.monotonic() - started) * 1000)
                     return result_model
                 except BusinessException as bex:
+                    # 上游有应答但无数据：源可达，计入被动指标但不计失败
+                    health.record_call(source, True, (time.monotonic() - started) * 1000)
                     logger.warning(f"Business query empty via '{source}' for '{symbol}' using '{source_symbol}': {bex}")
                     last_exception = bex
                 except Exception as ex:
+                    health.record_call(source, False, (time.monotonic() - started) * 1000, error=str(ex))
                     logger.error(f"System fetch failed via '{source}' for '{symbol}' using '{source_symbol}': {ex}")
                     last_exception = ex
                     # 递增失败计数器，达到阈值才熔断
@@ -305,6 +311,7 @@ class QuoteDispatcher:
                     fetch_symbols = list(symbol_mapping.keys())
                     
                     async with sem:
+                        started = time.monotonic()
                         try:
                             logger.info(f"Group batch fetching {len(fetch_symbols)} symbols via '{source}' (with_depth={with_depth})")
                             
@@ -334,11 +341,14 @@ class QuoteDispatcher:
                             
                             # 抓取成功，重置失败计数
                             QuoteDispatcher.reset_failures(source)
+                            health.record_call(source, True, (time.monotonic() - started) * 1000)
                             return processed_results
                         except BusinessException as bex:
+                            health.record_call(source, True, (time.monotonic() - started) * 1000)
                             logger.warning(f"Batch fetch business query error via '{source}': {bex}")
                             return {}
                         except Exception as ex:
+                            health.record_call(source, False, (time.monotonic() - started) * 1000, error=str(ex))
                             logger.error(f"Batch fetch failed via '{source}': {ex}")
                             # 递增失败计数器，达到阈值才熔断
                             QuoteDispatcher.record_failure(source)

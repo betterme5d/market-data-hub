@@ -2,6 +2,9 @@ import sys
 import os
 import unittest
 from unittest.mock import patch, AsyncMock
+import pytest
+
+pytestmark = pytest.mark.integration  # 需要真实外部网络，默认跳过
 
 # 确保能导入 providers
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -19,7 +22,7 @@ class TestKraneSharesProvider(unittest.IsolatedAsyncioTestCase):
         mock_get.return_value = mock_response
 
         # 由于 providers.kraneshares 尚未实现，导入此模块将报错，达到 failing test 的目的
-        from providers.kraneshares import KraneSharesProvider
+        from providers.misc.kraneshares import KraneSharesProvider
         provider = KraneSharesProvider()
         res = await provider.get_premium_discount("7615", "2026-06-01", "2026-06-05")
         

@@ -1,17 +1,20 @@
 import asyncio
 import sys
 import os
+import pytest
+
+pytestmark = pytest.mark.integration  # 需要真实外部网络，默认跳过
 
 # 将 src/funds.MarketData 加入 PYTHONPATH
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.models import UnifiedQuote
-from providers.tencent import TencentProvider
-from providers.sina import SinaProvider
-from providers.xueqiu import XueqiuProvider
-from providers.yfinance import YFinanceProvider
+from providers.quotes.tencent import TencentProvider
+from providers.quotes.sina import SinaProvider
+from providers.quotes.xueqiu import XueqiuProvider
+from providers.quotes.yfinance import YFinanceProvider
 from core.dispatcher import QuoteDispatcher
-from main import translate_standard_symbol
+from core.routing import translate_standard_symbol
 
 async def test_symbol_translation():
     print("=== [1] 测试代码自适应翻译 ===")
@@ -141,7 +144,7 @@ async def test_history_feature():
     
     # 1. 测试新浪内盘期货日 K 线
     try:
-        from providers.sina import SinaProvider
+        from providers.quotes.sina import SinaProvider
         provider = SinaProvider()
         res = await provider.get_history("nf_ag0", "1mo", "1d", "2026-06-01", "2026-06-15", "none")
         print(f"新浪内盘期货历史 K 线获取成功: {res.get('symbol')} -> 获取条数={len(res.get('data', []))}")
@@ -154,7 +157,7 @@ async def test_history_feature():
         
     # 2. 测试新浪外盘期货日 K 线
     try:
-        from providers.sina import SinaProvider
+        from providers.quotes.sina import SinaProvider
         provider = SinaProvider()
         res = await provider.get_history("hf_GC", "1mo", "1d", "2026-06-01", "2026-06-15", "none")
         print(f"新浪外盘期货历史 K 线获取成功: {res.get('symbol')} -> 获取条数={len(res.get('data', []))}")
@@ -167,7 +170,7 @@ async def test_history_feature():
 
     # 3. 测试雪球历史 K 线 (支持前/后复权)
     try:
-        from providers.xueqiu import XueqiuProvider
+        from providers.quotes.xueqiu import XueqiuProvider
         provider = XueqiuProvider()
         res = await provider.get_history("SH510300", "1mo", "1d", "2026-06-01", "2026-06-15", "qfq")
         print(f"雪球历史 K 线获取成功: {res.get('symbol')} -> 获取条数={len(res.get('data', []))}")
@@ -226,7 +229,7 @@ async def test_circuit_breaker_immunity():
 
 async def test_sources_status():
     print("=== [9] 测试行情数据源健康状态接口 ===")
-    from main import get_sources_status
+    from routers.health import get_sources_status
     status_list = await get_sources_status()
     print(f"  获取到的数据源健康状况列表:")
     for item in status_list:
@@ -250,7 +253,7 @@ async def test_manual_unblock():
         print()
         return
         
-    from main import unblock_source
+    from routers.health import unblock_source
     
     # 1. 强行拉黑 yfinance
     QuoteDispatcher.block_source("yfinance")

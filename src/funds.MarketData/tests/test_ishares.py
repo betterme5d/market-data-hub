@@ -2,6 +2,9 @@ import sys
 import os
 import unittest
 from unittest.mock import patch, MagicMock
+import pytest
+
+pytestmark = pytest.mark.integration  # 需要真实外部网络，默认跳过
 
 # 确保能导入 providers
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -25,7 +28,7 @@ class TestIsharesProvider(unittest.IsolatedAsyncioTestCase):
         mock_get.return_value = mock_response
 
         # 由于 providers.ishares 还未创建，此处导入会报错，实现 failing test
-        from providers.ishares import IsharesProvider
+        from providers.misc.ishares import IsharesProvider
         provider = IsharesProvider()
         res = await provider.get_premium_discount("239458/ishares-core", "2026-06-01", "2026-06-05")
         
@@ -49,7 +52,7 @@ class TestIsharesProvider(unittest.IsolatedAsyncioTestCase):
         """
         mock_get.return_value = mock_response
 
-        from providers.ishares import IsharesProvider
+        from providers.misc.ishares import IsharesProvider
         provider = IsharesProvider()
         res = await provider.get_premium_discount("239458/ishares-core", "2026-06-01", "2026-06-05")
         

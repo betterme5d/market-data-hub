@@ -2,6 +2,9 @@ import sys
 import os
 import pytest
 import httpx
+import pytest
+
+pytestmark = pytest.mark.integration  # 需要真实外部网络，默认跳过
 
 # Add parent dir to path to import main
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
