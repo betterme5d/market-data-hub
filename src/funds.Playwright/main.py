@@ -4,6 +4,7 @@ from playwright_stealth import Stealth
 import asyncio
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 
 # 配置日志
@@ -93,6 +94,30 @@ async def lifespan(app: FastAPI):
         logger.error(f"Error closing persistent browser: {ex}")
 
 app = FastAPI(title="Xueqiu Auth Service", lifespan=lifespan)
+
+# 分布式追踪（仅测试环境：dev compose 注入 OTEL_EXPORTER_OTLP_ENDPOINT；生产不注入则跳过）
+_OTEL_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+if _OTEL_ENDPOINT:
+    from opentelemetry import trace
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
+
+    _tracer_provider = TracerProvider(
+        resource=Resource.create({"service.name": "funds-playwright"}),
+        sampler=ParentBased(TraceIdRatioBased(float(os.getenv("OTEL_TRACES_SAMPLER_ARG", "1")))),
+    )
+    _tracer_provider.add_span_processor(
+        BatchSpanProcessor(OTLPSpanExporter(endpoint=f"{_OTEL_ENDPOINT.rstrip('/')}/v1/traces"))
+    )
+    trace.set_tracer_provider(_tracer_provider)
+    HTTPXClientInstrumentor().instrument()
+    FastAPIInstrumentor.instrument_app(app)
+    logger.info("OTel tracing enabled -> %s", _OTEL_ENDPOINT)
 
 
 @app.get("/health")

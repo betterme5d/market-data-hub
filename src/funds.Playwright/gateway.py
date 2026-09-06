@@ -17,6 +17,31 @@ logger = logging.getLogger("gateway")
 
 app = FastAPI(title="Playwright Gateway")
 
+# 分布式追踪（仅测试环境：dev compose 注入 OTEL_EXPORTER_OTLP_ENDPOINT；生产不注入则跳过）
+# 入站提取上游（marketdata/webapi）透传的 traceparent，出站 httpx 自动注入 traceparent 给 funds_playwright
+_OTEL_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+if _OTEL_ENDPOINT:
+    from opentelemetry import trace
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
+
+    _tracer_provider = TracerProvider(
+        resource=Resource.create({"service.name": "funds-playwright-gateway"}),
+        sampler=ParentBased(TraceIdRatioBased(float(os.getenv("OTEL_TRACES_SAMPLER_ARG", "1")))),
+    )
+    _tracer_provider.add_span_processor(
+        BatchSpanProcessor(OTLPSpanExporter(endpoint=f"{_OTEL_ENDPOINT.rstrip('/')}/v1/traces"))
+    )
+    trace.set_tracer_provider(_tracer_provider)
+    HTTPXClientInstrumentor().instrument()
+    FastAPIInstrumentor.instrument_app(app)
+    logger.info("OTel tracing enabled -> %s", _OTEL_ENDPOINT)
+
 # 检查是否在容器内运行，或指定目标服务地址
 RUNNING_IN_DOCKER = os.path.exists('/.dockerenv') or os.getenv("RUNNING_IN_DOCKER", "False").lower() == "true"
 TARGET_URL = os.getenv("PLAYWRIGHT_TARGET_URL", "http://funds_playwright:8000" if RUNNING_IN_DOCKER else "http://localhost:8098")

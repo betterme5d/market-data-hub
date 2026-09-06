@@ -5,6 +5,7 @@ WORKDIR /app
 # 预先安装好所有依赖，使用阿里云镜像加速
 RUN pip install --no-cache-dir \
     docker fastapi uvicorn httpx \
+    opentelemetry-sdk==1.44.0 opentelemetry-exporter-otlp-proto-http==1.44.0 opentelemetry-instrumentation-fastapi==0.65b0 opentelemetry-instrumentation-httpx==0.65b0 \
     -i http://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.aliyun.com
 
 # 默认启动 gateway.py
