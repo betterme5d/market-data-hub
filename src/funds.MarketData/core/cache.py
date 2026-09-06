@@ -66,24 +66,3 @@ def set_cached_anchor(symbol: str, data: dict, provider: str = "yfinance") -> No
     except Exception as e:
         logger.warning(f"Set cached anchor failed for {symbol}: {e}")
 
-def get_cached_valuations() -> Optional[list]:
-    if not redis_client:
-        return None
-    try:
-        key = "eastmoney:valuations:16_5"
-        data = redis_client.get(key)
-        if data:
-            return json.loads(data)
-    except Exception as e:
-        logger.warning(f"Get cached valuations failed: {e}")
-    return None
-
-def set_cached_valuations(data: list, ttl: int = 180) -> None:
-    if not redis_client:
-        return
-    try:
-        key = "eastmoney:valuations:16_5"
-        redis_client.setex(key, ttl, json.dumps(data))
-    except Exception as e:
-        logger.warning(f"Set cached valuations failed: {e}")
-

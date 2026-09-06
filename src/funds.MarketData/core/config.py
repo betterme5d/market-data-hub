@@ -33,9 +33,11 @@ VALKEY_PORT = _get_int("VALKEY_PORT", 6380)
 VALKEY_PASSWORD = _get("VALKEY_PASSWORD", "")
 
 # ---------- 上游数据源地址 ----------
-HOLIDAYS_BASE_URL = _get("HOLIDAYS_BASE_URL", "https://api.jiejiariapi.com")
 CFETS_BASE_URL = _get("CFETS_BASE_URL", "https://www.chinamoney.com.cn")
 CMTIDP_BASE_URL = _get("CMTIDP_BASE_URL", "http://eid.csrc.gov.cn")
+# 天天基金（东方财富）：历史净值接口域名 + 全量最新净值接口
+EASTMONEY_F10_BASE_URL = _get("EASTMONEY_F10_BASE_URL", "https://api.fund.eastmoney.com")
+EASTMONEY_FUND_BASE_URL = _get("EASTMONEY_FUND_BASE_URL", "https://fund.eastmoney.com")
 PLAYWRIGHT_GATEWAY_URL = _get("PLAYWRIGHT_GATEWAY_URL", "http://funds.playwright.gateway:8081")
 
 # ---------- 健康检查参数 ----------

@@ -8,7 +8,7 @@ pytestmark = pytest.mark.integration  # 需要真实外部网络，默认跳过
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from providers.funds.eastmoney import EastmoneyProvider
+from providers.funds.eastmoney import EastmoneySource
 
 def find_col_indices(headers, is_bond=False):
     indices = {}
@@ -49,7 +49,7 @@ def find_col_indices(headers, is_bond=False):
 async def test_main():
     import sys
     sys.stdout.reconfigure(encoding='utf-8')
-    provider = EastmoneyProvider()
+    provider = EastmoneySource()
     
     # 1. Fetch 160105 in 2026
     print("Fetching portfolio for 160105 in 2026...")

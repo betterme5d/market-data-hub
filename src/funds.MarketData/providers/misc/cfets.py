@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-中国外汇交易中心 CFETS（chinamoney.com.cn）薄代理 + 健康探针。
-C# 侧 CfetsService 消费契约：GET /ags/ms/cm-u-bk-ccpr/CcprHisNew?... 返回含 records 的 JSON。
+中国外汇交易中心 CFETS（chinamoney.com.cn）取数源 + 健康探针。
+查询转发契约：GET /ags/ms/cm-u-bk-ccpr/CcprHisNew?... 返回含 records 的 JSON。
 """
 import logging
 from datetime import date, timedelta
@@ -19,10 +19,23 @@ _USER_AGENT = (
 )
 
 
-class CfetsProvider(SourceProbe):
+class CfetsProbe(SourceProbe):
+    """CFETS 历史中间价接口的健康探针。"""
+
     name = "cfets"
     category = "misc"
 
+    async def probe(self) -> None:
+        """探针：查最近 7 天 USD/CNY 一页，要求返回可解析的 JSON（允许 records 为空）。"""
+        end = date.today()
+        start = end - timedelta(days=7)
+        qs = f"startDate={start}&endDate={end}&currency=USD/CNY&pageNum=1&pageSize=5"
+        data = await CfetsSource().get_middle_price_history(qs)
+        if not isinstance(data, dict) or "records" not in data:
+            raise RuntimeError("cfets probe: unexpected response shape (missing 'records')")
+
+
+class CfetsSource:
     def __init__(self, base_url: str | None = None):
         self.base_url = (base_url or config.CFETS_BASE_URL).rstrip("/")
 
@@ -36,12 +49,3 @@ class CfetsProvider(SourceProbe):
             resp = await client.get(url, headers={"User-Agent": _USER_AGENT})
             resp.raise_for_status()
             return resp.json()
-
-    async def probe(self) -> None:
-        """探针：查最近 7 天 USD/CNY 一页，要求返回可解析的 JSON（允许 records 为空）。"""
-        end = date.today()
-        start = end - timedelta(days=7)
-        qs = f"startDate={start}&endDate={end}&currency=USD/CNY&pageNum=1&pageSize=5"
-        data = await self.get_middle_price_history(qs)
-        if not isinstance(data, dict) or "records" not in data:
-            raise RuntimeError("cfets probe: unexpected response shape (missing 'records')")

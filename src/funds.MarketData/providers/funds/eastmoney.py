@@ -3,21 +3,72 @@ import json
 import logging
 import asyncio
 import requests
-import ssl
 import urllib3
+import httpx
 from bs4 import BeautifulSoup
 from typing import Dict, List, Any, Optional
+
+from core import config
+from core.models import FundNav
+from providers.base import SourceProbe
+from providers.funds.base_nav import FundNavProvider
 
 # 禁用未验证的 HTTPS 请求警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = logging.getLogger(__name__)
 
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
-class EastmoneyProvider:
+# lsjz 单基金历史净值单页上限（反爬限制，实测 pageSize 恒被上游封顶为 20）
+_LSJZ_PAGE_SIZE = 20
+# Fund_JJJZ_Data.aspx 全量最新净值单页上限（实测 20000）
+_JJJZ_PAGE_SIZE = 20000
+
+
+class EastmoneyProbe(SourceProbe):
+    """天天基金 lsjz（单基金历史净值）接口的健康探针。"""
+
+    name = "eastmoney"
+    category = "funds"
+
+    async def probe(self) -> None:
+        """对 lsjz 发起一次最轻量请求（1 页 1 条），失败抛异常。"""
+        data = await EastmoneySource()._fetch_lsjz_page("000001", 1, 1)
+        if data is None or str(data.get("ErrCode", "0")) != "0":
+            raise RuntimeError("eastmoney probe: lsjz abnormal response")
+        if not (data.get("Data") or {}).get("LSJZList"):
+            raise RuntimeError("eastmoney probe: lsjz returned empty list")
+
+
+class EastmoneyJjjzProbe(SourceProbe):
+    """天天基金 Fund_JJJZ_Data（全量最新净值）接口的健康探针。
+
+    与 lsjz 是同一个源（eastmoney）下的两个不同上游接口——外部 API 的参数/
+    验证/返回结构随时可能单独变化，1 个上游接口对应 1 个探针，缺一即静默失效。
+    """
+
+    name = "eastmoney-jjjz"
+    category = "funds"
+
+    async def probe(self) -> None:
+        """对 Fund_JJJZ_Data 发起一次最轻量请求（1 页 1 条），校验解析结构。"""
+        data = await EastmoneySource()._fetch_jjjz_page(1, 1)
+        if data is None:
+            raise RuntimeError("eastmoney-jjjz probe: request failed")
+        if not data.get("datas"):
+            raise RuntimeError("eastmoney-jjjz probe: empty datas")
+        if not data.get("showday"):
+            raise RuntimeError("eastmoney-jjjz probe: empty showday")
+
+
+class EastmoneySource(FundNavProvider):
     def __init__(self):
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": _UA,
             "Referer": "http://fundf10.eastmoney.com/",
         }
         self.url = "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
@@ -406,132 +457,232 @@ class EastmoneyProvider:
             logger.error(f"Failed to fetch fund info for {symbol}: {e}")
             return {"fund_code": symbol, "error": str(e)}
 
-    async def get_valuations(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
-        """
-        抓取、合并去重天天基金估值数据，仅返回以 16 和 5 开头的基金。
-        支持 3 分钟 Redis 缓存。
-        """
-        import time
-        import urllib.request
-        import urllib.parse
-        from datetime import datetime, timezone, timedelta
-        from core.cache import get_cached_valuations, set_cached_valuations
+    # ------------------------------------------------------------------
+    # 统一净值接口实现（FundNavProvider）
+    # ------------------------------------------------------------------
 
-        # 1. 尝试缓存命中
-        if not force_refresh:
-            cached = get_cached_valuations()
-            if cached is not None:
-                return cached
+    @staticmethod
+    def _to_nav_float(val) -> Optional[float]:
+        """把上游字符串转 float，空串/无意义标记返回 None。"""
+        if val is None or val == "" or val == "---" or val == "-":
+            return None
+        try:
+            return float(str(val).replace(",", "").strip())
+        except (ValueError, TypeError):
+            return None
 
-        loop = asyncio.get_event_loop()
-
-        # 2. 获取 type=0 和 type=9 原始数据
-        # 使用 run_in_executor 避免阻塞 FastAPI 异步主循环
-        params_0 = {
-            "type": "0",
-            "sort": "3",
-            "orderType": "desc",
-            "canbuy": "0",
-            "pageIndex": "1",
-            "pageSize": "40000",
-            "callback": "",
-            "_": str(int(time.time() * 1000)),
+    async def _fetch_lsjz_page(
+        self,
+        fund_code: str,
+        page_index: int,
+        page_size: int,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> Optional[Dict[str, Any]]:
+        """请求单基金历史净值 lsjz 一页，返回 JSON（反爬要求 Referer + UA）。"""
+        url = f"{config.EASTMONEY_F10_BASE_URL}/f10/lsjz"
+        params: Dict[str, Any] = {
+            "fundCode": fund_code,
+            "pageIndex": page_index,
+            "pageSize": page_size,
         }
-        params_9 = {
-            "type": "9",
-            "sort": "3",
-            "orderType": "desc",
-            "canbuy": "0",
-            "pageIndex": "1",
-            "pageSize": "40000",
-            "callback": "",
-            "_": str(int(time.time() * 1000) + 1),
+        if start_date:
+            params["startDate"] = start_date
+        if end_date:
+            params["endDate"] = end_date
+        headers = {
+            "User-Agent": _UA,
+            "Referer": "http://fundf10.eastmoney.com/",
         }
+        try:
+            async with httpx.AsyncClient(
+                timeout=config.UPSTREAM_TIMEOUT, verify=False
+            ) as client:
+                resp = await client.get(url, params=params, headers=headers)
+                resp.raise_for_status()
+                return resp.json()
+        except Exception as e:
+            logger.error(f"Fetch lsjz failed for {fund_code} page {page_index}: {e}")
+            return None
 
-        # 为了避免短时间内两个请求并发引起外部防爬封锁，引入 0.5s 的间隔
-        def fetch_sync(params):
-            url = f"https://api.fund.eastmoney.com/FundGuZhi/GetFundGZList?{urllib.parse.urlencode(params)}"
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "Referer": "https://fund.eastmoney.com/",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                },
+    async def get_fund_nav_history(
+        self, code: str, start_date: str | None = None, end_date: str | None = None
+    ) -> List[FundNav]:
+        """
+        获取单只基金历史净值。内部 while 循环分页（pageSize 上限 20），
+        日期区间直接透传上游（startDate/endDate）以减小分页量。
+        Returns 按 nav_date 升序。
+        """
+        items: List[FundNav] = []
+        page_index = 1
+        seen = 0
+        total = None
+
+        while True:
+            data = await self._fetch_lsjz_page(
+                code, page_index, _LSJZ_PAGE_SIZE, start_date, end_date
             )
-            try:
-                context = ssl._create_unverified_context()
-                with urllib.request.urlopen(req, timeout=15, context=context) as response:
-                    return json.loads(response.read().decode("utf-8"))
-            except Exception as ex:
-                logger.error(f"Fetch Eastmoney list failed with params {params}: {ex}")
-                return {}
+            if data is None or str(data.get("ErrCode", "0")) != "0":
+                logger.warning(f"lsjz abnormal response for {code} page {page_index}: {str(data)[:200]}")
+                break
 
-        task_0 = loop.run_in_executor(None, fetch_sync, params_0)
-        await asyncio.sleep(0.5)  # 串行延时，保护 IP 稳定性
-        task_9 = loop.run_in_executor(None, fetch_sync, params_9)
+            if total is None:
+                try:
+                    total = int(data.get("TotalCount", 0))
+                except (TypeError, ValueError):
+                    total = 0
 
-        data_0, data_9 = await asyncio.gather(task_0, task_9)
-
-        list_0 = data_0.get("Data", {}).get("list", []) or []
-        list_9 = data_9.get("Data", {}).get("list", []) or []
-
-        # 3. 合并去重并筛选 16 和 5 开头的上市基金 (过滤掉非上市的场外联接基金和上交所场外老基金)
-        merged = {}
-        for item in list_0 + list_9:
-            bzdm = item.get("bzdm")
-            jjjc = item.get("jjjc") or ""
-            if bzdm and (bzdm.startswith("16") or bzdm.startswith("5")):
-                # 1. 过滤含有 "联接" 或 "连接" 且不含 "LOF" 且不含 'A' 的场外联接基金
-                if ("联接" in jjjc or "连接" in jjjc) and (
-                    "LOF" not in jjjc and "A" not in jjjc
-                ):
+            lst = (data.get("Data") or {}).get("LSJZList") or []
+            for row in lst:
+                nav_date = row.get("FSRQ")
+                if not nav_date:
                     continue
-                # 2. 过滤含有 "ETF" 关键字，且不含"联接" 或 "连接" ,且不含 "LOF" 或 "A" 的基金 (防止过滤掉 ETF联接LOF 基金)
-                if (
-                    "ETF" in jjjc.upper()
-                    and not ("联接" in jjjc or "连接" in jjjc)
-                    and not ("LOF" in jjjc.upper() and "A" not in jjjc.upper())
-                ):
-                    continue
-                # 3. 过滤上交所场外老基金系列前缀 (519, 530, 540, 550 开头)
-                if bzdm.startswith("5") and bzdm.startswith(
-                    ("519", "530", "540", "550")
-                ):
-                    continue
-                merged[bzdm] = item
+                items.append(
+                    FundNav(
+                        code=code,
+                        nav_date=nav_date,
+                        unit_nav=self._to_nav_float(row.get("DWJZ")),
+                        accum_nav=self._to_nav_float(row.get("LJJZ")),
+                    )
+                )
 
-        # 4. 数据清洗和标准化
-        fetched_at = datetime.now(timezone(timedelta(hours=8))).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+            seen += len(lst)
+            if not lst or (total and seen >= total) or len(lst) < _LSJZ_PAGE_SIZE:
+                break
+            page_index += 1
 
-        def to_float(val) -> Optional[float]:
-            if not val or val in ("---", "-", None):
+        # 升序（lsjz 默认按日期倒序返回，历史补全需要升序）
+        items.sort(key=lambda x: x.nav_date)
+        return items
+
+    async def _fetch_jjjz_page(
+        self, page_index: int, page_size: int
+    ) -> Optional[Dict[str, Any]]:
+        """请求全量最新净值 Fund_JJJZ_Data.aspx 一页，解析 `var db={...}` JS。"""
+        url = f"{config.EASTMONEY_FUND_BASE_URL}/Data/Fund_JJJZ_Data.aspx"
+        params = {
+            "t": "1",
+            "lx": "1",
+            "sort": "rzdf,desc",
+            "page": f"{page_index},{page_size}",
+            "onlySale": "0",
+            "isLatest": "0",
+        }
+        headers = {
+            "User-Agent": _UA,
+            "Referer": "https://fund.eastmoney.com/fund.html",
+        }
+        try:
+            async with httpx.AsyncClient(
+                timeout=config.UPSTREAM_TIMEOUT, verify=False
+            ) as client:
+                resp = await client.get(url, params=params, headers=headers)
+                resp.raise_for_status()
+                text = resp.text
+        except Exception as e:
+            logger.error(f"Fetch JJJZ failed page {page_index}: {e}")
+            return None
+
+        # 返回形如 var db={chars:["0",...],datas:[["...","..."],...],pages:"2",...};
+        # 是 JS 对象字面量（外层 key 为裸标识符，数组值为双引号字符串），不能直接 json.loads。
+        # datas 数组内可能嵌套空数组 []，不能用简单正则，改用括号配对扫描精确截取。
+        def _extract_array(name: str) -> Optional[str]:
+            key_idx = text.find(name + ":")
+            if key_idx < 0:
                 return None
-            try:
-                return float(str(val).replace("%", "").replace(",", "").strip())
-            except ValueError:
+            start = text.find("[", key_idx)
+            if start < 0:
                 return None
+            depth = 0
+            in_str = False
+            esc = False
+            for i in range(start, len(text)):
+                ch = text[i]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
+                    continue
+                if ch == '"':
+                    in_str = True
+                elif ch == "[":
+                    depth += 1
+                elif ch == "]":
+                    depth -= 1
+                    if depth == 0:
+                        return text[start : i + 1]
+            return None
 
-        result_list = []
-        for bzdm, item in merged.items():
-            est_val = to_float(item.get("gsz"))
-            if est_val is None:
-                continue
+        try:
+            datas_raw = _extract_array("datas")
+            showday_raw = _extract_array("showday")
+            # pages 是字符串如 "2"（非数组），单独用正则取
+            pages_match = re.search(r"\bpages\s*:\s*\"([^\"]*)\"", text)
+            pages_val = pages_match.group(1) if pages_match else "1"
+            return {
+                "datas": json.loads(datas_raw) if datas_raw else [],
+                "showday": json.loads(showday_raw) if showday_raw else [],
+                "pages": pages_val,
+            }
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.error(f"JJJZ parse failed page {page_index}: {e}")
+            return None
 
-            result_list.append(
-                {
-                    "fund_code": bzdm,
-                    "fund_name": item.get("jjjc"),
-                    "fund_type": item.get("FType"),
-                    "net_value": to_float(item.get("dwjz")),
-                    "estimated_value": est_val,
-                    "estimated_growth_rate": to_float(item.get("gszzl")),
-                    "valuation_date": item.get("gzrq"),
-                    "update_date": fetched_at,  # 抓取发生那一刻的时间
-                }
-            )
+    async def get_latest_all_nav(self) -> List[FundNav]:
+        """
+        获取最新一期所有基金净值（全量）。内部循环分页（pageSize 20000，实测 2 页）。
+        净值日期来自顶层 showday[0]（最新日）。
+        """
+        items: List[FundNav] = []
+        page_index = 1
+        total_pages: Optional[int] = None
 
-        # 5. 写入 Redis 缓存 (3分钟过期)
-        set_cached_valuations(result_list, ttl=180)
-        return result_list
+        while True:
+            data = await self._fetch_jjjz_page(page_index, _JJJZ_PAGE_SIZE)
+            if data is None:
+                break
+
+            showday = data.get("showday") or []
+            latest_date = showday[0] if showday else ""
+
+            if total_pages is None:
+                try:
+                    total_pages = int(data.get("pages", "1"))
+                except (TypeError, ValueError):
+                    total_pages = 1
+
+            datas = data.get("datas") or []
+            for row in datas:
+                if not isinstance(row, (list, tuple)) or len(row) < 5:
+                    continue
+                code = row[0]
+                if not code or not latest_date:
+                    continue
+                unit_nav = self._to_nav_float(row[3])
+                accum_nav = self._to_nav_float(row[4])
+                # 跳过无净值数据的基金（第 3/4 列均为空）
+                if unit_nav is None and accum_nav is None:
+                    continue
+                items.append(
+                    FundNav(
+                        code=code,
+                        nav_date=latest_date,
+                        unit_nav=unit_nav,
+                        accum_nav=accum_nav,
+                    )
+                )
+
+            if not datas:
+                break
+            if total_pages and page_index >= total_pages:
+                break
+            page_index += 1
+
+        return items
+
+    # ------------------------------------------------------------------
+    # 健康探针已上移到 EastmoneyProbe（见文件头部）
+    # ------------------------------------------------------------------

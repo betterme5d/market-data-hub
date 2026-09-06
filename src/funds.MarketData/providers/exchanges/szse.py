@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-深交所各站点的健康探针（业务调用经 core.reverse_proxy 转发，这里只做主动探测）。
+深交所各站点的健康探针与取数源（基金列表、官方交易日历 monthList）。
 """
 import logging
-from datetime import date
+from datetime import date, timedelta
+from typing import List, Optional, Tuple
 
 import httpx
 
@@ -16,6 +17,9 @@ _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+
+# 深交所官方交易日历接口：month=YYYY-MM 返回该月完整日历，jybz=1 表示交易日。
+SZSE_CALENDAR_URL = "https://www.szse.cn/api/report/exchange/onepersistenthour/monthList"
 
 
 async def _reachability(url: str, verify: bool = True) -> None:
@@ -78,3 +82,145 @@ class SzseDiscProbe(SourceProbe):
 
     async def probe(self) -> None:
         await _reachability("https://disc.static.szse.cn/", verify=False)
+
+
+class SzseCalendarProbe(SourceProbe):
+    """深交所交易日历 monthList 接口的健康探针（复用 SzseCalendarSource 同一取数/解析路径）。"""
+
+    name = "szse-calendar"
+    category = "exchanges"
+
+    async def probe(self) -> None:
+        """语义探针：走 Source 的真实解析路径取当月日历，解析失败或空集即判失效。
+
+        探针不复制 URL/解析逻辑——否则探测请求与业务请求会漂移，探针绿而业务断。
+        """
+        days = await SzseCalendarSource().get_month_days(date.today().strftime("%Y-%m"))
+        if not days:
+            raise RuntimeError("szse-calendar probe: empty month days")
+
+
+class SzseCalendarSource:
+    """深交所官方交易日历取数源。
+
+    只依赖 monthList 轻量 JSON 接口（无重库），并提供按自然日缓存，
+    供 cmtidp 等业务方计算「最近一个交易日（<= 当前日期）」。
+    """
+
+    def __init__(self, base_url: str | None = None):
+        self.base_url = (base_url or SZSE_CALENDAR_URL).rstrip("/")
+        self._cache_day: Optional[str] = None
+        self._cache_latest: Optional[str] = None
+
+    async def get_month_days(self, month: str) -> List[Tuple[str, bool]]:
+        """获取某月（YYYY-MM）完整日历，返回 [(jyrq, is_trading), ...]，按日期升序。"""
+        async with httpx.AsyncClient(timeout=config.UPSTREAM_TIMEOUT,
+                                     headers={"User-Agent": _UA, "Referer": "https://www.szse.cn/"}) as client:
+            resp = await client.get(f"{self.base_url}?month={month}")
+            resp.raise_for_status()
+            payload = resp.json()
+        data = payload.get("data") or []
+        days = [(row["jyrq"], row["jybz"] == "1") for row in data if row.get("jyrq")]
+        days.sort(key=lambda x: x[0])
+        return days
+
+    async def latest_trading_day(self, as_of: Optional[str] = None) -> Optional[str]:
+        """返回 <= as_of（默认今天）的最近一个交易日；同一天内命中缓存，不重复请求上游。"""
+        today = (date.fromisoformat(as_of) if as_of else date.today())
+        cache_key = today.isoformat()
+        if self._cache_day == cache_key and self._cache_latest is not None:
+            return self._cache_latest
+
+        result: Optional[str] = None
+        # 跨月回溯：最多回溯 2 个月，覆盖月初/跨年边界（长假最长跨 1 个月）。
+        for offset in range(2):
+            month_first = today.replace(day=1) - timedelta(days=offset * 28)
+            month = month_first.strftime("%Y-%m")
+            try:
+                days = await self.get_month_days(month)
+            except Exception as e:
+                logger.error(f"szse calendar fetch failed for {month}: {e}")
+                continue
+            # 当月内 <= today 的交易日里取最后一个
+            for jyrq, is_trading in days:
+                if jyrq <= cache_key and is_trading:
+                    result = jyrq  # days 升序，持续覆盖即为最后一个
+            if result is not None:
+                break
+
+        self._cache_day = cache_key
+        self._cache_latest = result
+        return result
+
+
+class SzseFundListProbe(SourceProbe):
+    """深交所 ETF/LOF 基金列表 ShowReport 接口的健康探针（复用 SzseFundListSource 同一取数/解析路径）。"""
+
+    name = "szse-fund-list"
+    category = "exchanges"
+
+    async def probe(self) -> None:
+        """语义探针：走 Source 的真实解析路径取 ETF 报表，解析失败或空集即判失效。
+
+        探针不复制 URL/解析逻辑——否则探测请求与业务请求会漂移，探针绿而业务断。
+        """
+        rows = await SzseFundListSource()._fetch_report(SzseFundListSource.ETF_URL, "ETF")
+        if not rows:
+            raise RuntimeError("szse-fund-list probe: empty xlsx")
+
+
+class SzseFundListSource:
+    """深交所 ETF/LOF 基金列表取数源（ShowReport，xlsx）。"""
+
+    EXCHANGE = "SZ"
+    ETF_URL = (
+        "https://www.szse.cn/api/report/ShowReport?SHOWTYPE=xlsx&CATALOGID=1945"
+        "&tab1PAGENO=1&random=0.6034564625944207&TABKEY=tab1"
+    )
+    LOF_URL = (
+        "https://www.szse.cn/api/report/ShowReport?SHOWTYPE=xlsx&CATALOGID=1945_LOF"
+        "&tab1PAGENO=1&random=0.6993308271523111&TABKEY=tab1"
+    )
+
+    async def _fetch_report(self, url: str, fund_type: str) -> list:
+        """请求一张 ShowReport xlsx 并解析（业务与探针共用同一代码路径）。"""
+        async with httpx.AsyncClient(verify=False) as client:
+            resp = await client.get(url, timeout=30)
+            if resp.status_code != 200:
+                return []
+            return self._parse_xlsx(resp.content, fund_type)
+
+    async def fetch_funds(self) -> list:
+        """获取深交所 ETF 与 LOF 基金列表。"""
+        results: list = []
+        for url, ftype in ((self.ETF_URL, "ETF"), (self.LOF_URL, "LOF")):
+            try:
+                results.extend(await self._fetch_report(url, ftype))
+            except Exception as e:
+                logger.error(f"Error fetching SZSE {ftype} funds: {e}")
+        return results
+
+    def _parse_xlsx(self, content: bytes, fund_type: str) -> list:
+        """解析 ShowReport 返回的 xlsx：第 1 列代码、第 2 列名称。"""
+        import io
+
+        import pandas as pd
+
+        rows = []
+        df = pd.read_excel(io.BytesIO(content), engine="openpyxl")
+        for _, row in df.iterrows():
+            code = str(row.iloc[0]).strip()
+            name = str(row.iloc[1]).strip()
+            if not code or code == "nan":
+                continue
+            try:
+                code = str(int(float(code))).zfill(6)
+            except (ValueError, TypeError):
+                code = code.zfill(6)
+            rows.append({
+                "fund_code": code,
+                "fund_name": name,
+                "fund_type": fund_type,
+                "exchange": self.EXCHANGE,
+            })
+        return rows

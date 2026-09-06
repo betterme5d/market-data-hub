@@ -46,3 +46,20 @@ class UnifiedQuote(BaseModel):
 
 # 保持接口兼容别名
 UnifiedQuoteOut = UnifiedQuote
+
+
+class FundNav(BaseModel):
+    """统一基金净值单条数据（各数据源映射为同一结构）。"""
+
+    code: str  # 基金代码（6 位）
+    nav_date: str  # 净值日期 (YYYY-MM-DD)
+    unit_nav: Optional[float] = None  # 单位净值（份额净值）
+    accum_nav: Optional[float] = None  # 累计净值
+
+
+class FundNavResponse(BaseModel):
+    """统一净值接口响应包装。"""
+
+    source: str  # 实际数据源（回显）
+    count: int  # 本批条数
+    items: List[FundNav] = []

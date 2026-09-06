@@ -16,16 +16,3 @@ def isolated_health_store(monkeypatch):
     health_svc._memory_calls.clear()
     health_svc._last_status.clear()
     yield
-
-
-@pytest.fixture
-def fixture_loader():
-    """加载 tests/fixtures 下的录制响应。"""
-    import json
-    base = os.path.join(os.path.dirname(__file__), "fixtures")
-
-    def load(name: str):
-        with open(os.path.join(base, name), encoding="utf-8") as f:
-            return json.load(f)
-
-    return load

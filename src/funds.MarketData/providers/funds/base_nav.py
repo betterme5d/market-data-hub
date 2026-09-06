@@ -1,0 +1,33 @@
+# -*- coding: utf-8 -*-
+"""
+统一基金净值 Provider 抽象。
+
+不同数据源（cmtidp / eastmoney 等）实现同一契约，对外由统一路由分发。
+两个能力：
+- get_latest_all_nav：获取最新一期全量基金净值（各源"最新"语义，不承诺指定日期）
+- get_fund_nav_history：获取单只基金在日期区间内的历史净值
+
+分页循环在 Provider 内部消化，对外一次性返回标准 FundNav 列表。
+"""
+from abc import ABC, abstractmethod
+from typing import List
+
+from core.models import FundNav
+
+
+class FundNavProvider(ABC):
+    """净值数据源统一接口。实现类需同时提供健康探针（SourceProbe）。"""
+
+    name: str = ""
+
+    @abstractmethod
+    async def get_latest_all_nav(self) -> List[FundNav]:
+        """获取最新一期所有基金净值。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_fund_nav_history(
+        self, code: str, start_date: str | None = None, end_date: str | None = None
+    ) -> List[FundNav]:
+        """获取单只基金在 [start_date, end_date] 内的历史净值（内部消化分页）。"""
+        raise NotImplementedError
