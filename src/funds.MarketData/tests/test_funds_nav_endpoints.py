@@ -45,6 +45,34 @@ def test_navs_success(mock_get_nav):
     assert data["items"][0]["nav_date"] == "2024-01-02"
 
 
+@patch("routers.funds.fund_nav_provider.get_fund_nav_history", new_callable=AsyncMock)
+def test_navs_source_resolutions(mock_get_nav):
+    mock_get_nav.return_value = [
+        FundNav(code="510300", nav_date="2024-01-02", unit_nav=3.5, accum_nav=3.6)
+    ]
+
+    # 1. 显式 Query 参数 source=cmtidp
+    resp1 = client.get("/api/v1/funds/510300/navs?start_date=2024-01-01&end_date=2024-01-10&source=cmtidp")
+    assert resp1.status_code == 200
+    assert resp1.json()["source"] == "cmtidp"
+    mock_get_nav.assert_called_with("510300", start_date="2024-01-01", end_date="2024-01-10", source="cmtidp")
+
+    # 2. 大小写容错 Query 参数 Source=cmtidp
+    resp2 = client.get("/api/v1/funds/510300/navs?start_date=2024-01-01&end_date=2024-01-10&Source=cmtidp")
+    assert resp2.status_code == 200
+    assert resp2.json()["source"] == "cmtidp"
+
+    # 3. Header 传递 source: cmtidp
+    resp3 = client.get("/api/v1/funds/510300/navs?start_date=2024-01-01&end_date=2024-01-10", headers={"source": "cmtidp"})
+    assert resp3.status_code == 200
+    assert resp3.json()["source"] == "cmtidp"
+
+    # 4. Header 传递 x-source: cmtidp
+    resp4 = client.get("/api/v1/funds/510300/navs?start_date=2024-01-01&end_date=2024-01-10", headers={"x-source": "cmtidp"})
+    assert resp4.status_code == 200
+    assert resp4.json()["source"] == "cmtidp"
+
+
 def test_legacy_history_missing_dates():
     # 旧端点未传日期报错 400
     resp = client.get("/api/fund-nav/history?source=eastmoney&code=510300")

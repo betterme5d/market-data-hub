@@ -91,3 +91,61 @@ async def test_get_fund_dates():
             "establish_date": "2012-05-04",
             "list_date": "2012-05-28",
         }
+
+
+@pytest.mark.asyncio
+async def test_collect_fund_dates():
+    from unittest.mock import AsyncMock, patch
+    from providers.funds.fund_profile import collect_fund_dates
+
+    mock_establish = {"510300": "2012-05-04", "159915": "2011-09-20"}
+    mock_listing = {
+        "SH": {"510300": "2012-05-28"},
+        "SZ": {"159915": "2011-12-09"},
+    }
+
+    with patch(
+        "providers.funds.establish_dates.EstablishDateProvider.get_all",
+        new=AsyncMock(return_value=mock_establish),
+    ) as mock_est_get_all, patch(
+        "providers.exchanges.listing_dates.ListingDateProvider.get_all",
+        new=AsyncMock(return_value=mock_listing),
+    ) as mock_list_get_all:
+        items = await collect_fund_dates(force=True)
+        mock_est_get_all.assert_awaited_once_with(force=True)
+        mock_list_get_all.assert_awaited_once_with(force=True)
+
+        by_code = {item["fund_code"]: item for item in items}
+        assert by_code["510300"] == {
+            "fund_code": "510300",
+            "establish_date": "2012-05-04",
+            "list_date": "2012-05-28",
+        }
+        assert by_code["159915"] == {
+            "fund_code": "159915",
+            "establish_date": "2011-09-20",
+            "list_date": "2011-12-09",
+        }
+
+
+def test_api_fund_dates_batch_endpoint():
+    from unittest.mock import AsyncMock, patch
+    from fastapi.testclient import TestClient
+    from main import app
+
+    client = TestClient(app)
+    mock_items = [
+        {"fund_code": "510300", "establish_date": "2012-05-04", "list_date": "2012-05-28"}
+    ]
+
+    with patch(
+        "routers.funds.collect_fund_dates",
+        new=AsyncMock(return_value=mock_items),
+    ) as mock_collect:
+        resp = client.get("/api/v1/funds/dates?refresh=true")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["dates"] == mock_items
+        assert data["profiles"] == mock_items
+        assert mock_collect.call_args.kwargs["force"] is True
+

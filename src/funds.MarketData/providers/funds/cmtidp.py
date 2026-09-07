@@ -43,26 +43,13 @@ class CmtidpProbe(SourceProbe):
         from datetime import date
 
         today = date.today().strftime("%Y-%m-%d")
-        ao_data = [
-            {"name": "sEcho", "value": 1},
-            {"name": "iColumns", "value": 5},
-            {"name": "sColumns", "value": ",,,,"},
-            {"name": "iDisplayStart", "value": 0},
-            {"name": "iDisplayLength", "value": 1},
-            {"name": "mDataProp_0", "value": "fund"},
-            {"name": "mDataProp_1", "value": "fund"},
-            {"name": "mDataProp_2", "value": "fund"},
-            {"name": "mDataProp_3", "value": "fund"},
-            {"name": "mDataProp_4", "value": "valuationDate"},
-            {"name": "fundType", "value": "all"},
-            {"name": "fundCompanyShortName", "value": ""},
-            {"name": "fundCode", "value": "000001"},
-            {"name": "fundName", "value": ""},
-            {"name": "startDate", "value": today},
-            {"name": "endDate", "value": today},
-        ]
-        qs = f"aoData={quote(json.dumps(ao_data, separators=(',', ':')))}&_={int(time.time() * 1000)}"
-        data = await CmtidpSource().get_fund_net_values(qs)
+        data = await CmtidpSource()._fetch_page(
+            fund_code="000001",
+            start_date=today,
+            end_date=today,
+            start=0,
+            length=1,
+        )
         if not isinstance(data, dict) or "iTotalRecords" not in data:
             raise RuntimeError("cmtidp probe: unexpected response shape (missing 'iTotalRecords')")
 
@@ -93,21 +80,21 @@ class CmtidpSource(FundNavProvider):
         start: int,
         length: int,
     ) -> List[dict]:
-        """构造 getPublicFundJZInfoMore.do 的 aoData 参数（对齐 C# 侧结构）。"""
+        """构造 getPublicFundJZInfoMore.do 的 aoData 参数（1:1 严格对齐 C# CMTIDPService）。"""
         return [
             {"name": "sEcho", "value": 15},
-            {"name": "iColumns", "value": 4},
-            {"name": "sColumns", "value": ",,,"},
+            {"name": "iColumns", "value": 5},
+            {"name": "sColumns", "value": ",,,,"},
             {"name": "iDisplayStart", "value": start},
             {"name": "iDisplayLength", "value": length},
-            {"name": "mDataProp_0", "value": "code"},
-            {"name": "mDataProp_1", "value": "shortName"},
-            {"name": "mDataProp_2", "value": "valuationDate"},
-            {"name": "mDataProp_3", "value": "shareNetValue"},
-            {"name": "mDataProp_4", "value": "totalNetValue"},
+            {"name": "mDataProp_0", "value": "fund"},
+            {"name": "mDataProp_1", "value": "fund"},
+            {"name": "mDataProp_2", "value": "fund"},
+            {"name": "mDataProp_3", "value": "fund"},
+            {"name": "mDataProp_4", "value": "valuationDate"},
             {"name": "fundType", "value": "all"},
             {"name": "fundCompanyShortName", "value": ""},
-            {"name": "fundCode", "value": fund_code},
+            {"name": "fundCode", "value": fund_code or ""},
             {"name": "fundName", "value": ""},
             {"name": "startDate", "value": start_date},
             {"name": "endDate", "value": end_date},
@@ -180,11 +167,14 @@ class CmtidpSource(FundNavProvider):
                 nav_date = row.get("valuationDate")
                 if not code or not nav_date:
                     continue
+                unit_nav = self._to_nav_float(row.get("shareNetValue"))
+                if unit_nav is None:
+                    continue
                 items.append(
                     FundNav(
                         code=code,
                         nav_date=nav_date,
-                        unit_nav=self._to_nav_float(row.get("shareNetValue")),
+                        unit_nav=unit_nav,
                         accum_nav=self._to_nav_float(row.get("totalNetValue")),
                     )
                 )
@@ -231,11 +221,14 @@ class CmtidpSource(FundNavProvider):
                 nav_date = row.get("valuationDate")
                 if not nav_date:
                     continue
+                unit_nav = self._to_nav_float(row.get("shareNetValue"))
+                if unit_nav is None:
+                    continue
                 items.append(
                     FundNav(
                         code=code,
                         nav_date=nav_date,
-                        unit_nav=self._to_nav_float(row.get("shareNetValue")),
+                        unit_nav=unit_nav,
                         accum_nav=self._to_nav_float(row.get("totalNetValue")),
                     )
                 )

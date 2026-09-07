@@ -4,7 +4,7 @@
 """
 import logging
 
-from fastapi import APIRouter, HTTPException, Path, Query
+from fastapi import APIRouter, Header, HTTPException, Path, Query, Request
 
 from core.models import FundNavResponse
 from providers.exchanges.exchange import ExchangeProvider
@@ -70,14 +70,20 @@ async def get_fund_info(
 
 @router.get("/api/v1/funds/dates", tags=["基金数据"], summary="获取基金关键日期汇总（成立/上市日期，批量采集）")
 @router.get("/api/v1/funds/profiles", tags=["基金数据"], summary="获取基金关键日期汇总（旧接口别名，兼容用）", deprecated=True)
-async def get_fund_dates_batch():
+async def get_fund_dates_batch(
+    refresh: bool = Query(False, description="true 时强制重新拉取上游并覆盖本地文件缓存"),
+):
     """
     合并东财场内基金（成立日期）与沪深交易所列表（上市日期）的全量基金关键日期。
     供 C# 等后台任务批量回填 funds 表。
     响应同时提供 'dates' 与 'profiles' 键，兼顾新标准与旧客户端兼容。
     """
     try:
-        items = await collect_fund_dates()
+        items = await collect_fund_dates(
+            force=refresh,
+            establish_provider=establish_date_provider,
+            listing_provider=listing_date_provider,
+        )
         return {"dates": items, "profiles": items}
     except Exception as e:
         logger.error(f"Get fund dates failed: {e}")
@@ -90,7 +96,11 @@ async def get_single_fund_dates(code: str = Path(..., description="基金代码�
     获取单只基金的成立日期与上市日期汇总。
     """
     try:
-        return await get_fund_dates(code)
+        return await get_fund_dates(
+            code,
+            establish_provider=establish_date_provider,
+            listing_provider=listing_date_provider,
+        )
     except Exception as e:
         logger.error(f"Get fund dates failed for {code}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -237,6 +247,9 @@ async def get_fund_navs(
     start_date: str = Query(..., description="起始日期 (YYYY-MM-DD)，必填"),
     end_date: str = Query(..., description="结束日期 (YYYY-MM-DD)，必填"),
     source: str | None = Query(None, description="数据源：eastmoney (默认) | cmtidp"),
+    header_source: str | None = Header(None, alias="source", description="Header 透传数据源"),
+    x_source: str | None = Header(None, alias="x-source", description="Header 透传数据源 (X-Source)"),
+    request: Request = None,
 ):
     """
     获取指定基金在 [start_date, end_date] 区间的历史净值列表。
@@ -245,6 +258,16 @@ async def get_fund_navs(
     clean_code = code.strip()
     s_date = start_date.strip()
     e_date = end_date.strip()
+
+    # 优先从 Query -> Header (source / x-source) -> URL 参数大小写变体中解析数据源
+    raw_source = source or header_source or x_source
+    if not raw_source and request is not None:
+        for qk, qv in request.query_params.items():
+            if qk.lower() in ("source", "data_source", "datasource", "provider"):
+                raw_source = qv
+                break
+
+    resolved_source = (raw_source or "eastmoney").strip().lower()
 
     if not (len(clean_code) == 6 and clean_code.isdigit()):
         raise HTTPException(status_code=400, detail=f"Invalid fund code: {code}, must be 6 digits")
@@ -257,9 +280,8 @@ async def get_fund_navs(
 
     try:
         items = await fund_nav_provider.get_fund_nav_history(
-            clean_code, start_date=s_date, end_date=e_date, source=source
+            clean_code, start_date=s_date, end_date=e_date, source=resolved_source
         )
-        resolved_source = (source or "eastmoney").strip().lower()
         return FundNavResponse(source=resolved_source, count=len(items), items=items)
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))

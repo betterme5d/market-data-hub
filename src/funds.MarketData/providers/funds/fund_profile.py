@@ -18,8 +18,7 @@ import httpx
 
 from core import config
 from providers.base import SourceProbe
-from providers.exchanges.sse import SseFundListSource
-from providers.exchanges.listing_dates import SzseListingDateSource
+from providers.exchanges.listing_dates import ListingDateProvider
 
 logger = logging.getLogger(__name__)
 
@@ -164,14 +163,24 @@ EastmoneyFbRankProbe = EastmoneyEstablishDateProbe
 EastmoneyExchangeRankSource = EastmoneyEstablishDateSource
 
 
-async def collect_fund_dates() -> List[Dict[str, Optional[str]]]:
-    """合并基金关键日期: 成立日期(东财场内+开放排行缓存) + 上市日期(SSE 原生 + SZSE 1105)。
+async def collect_fund_dates(
+    force: bool = False,
+    establish_provider: Optional[EstablishDateProvider] = None,
+    listing_provider: Optional[ListingDateProvider] = None,
+) -> List[Dict[str, Optional[str]]]:
+    """合并基金关键日期: 成立日期(东财场内+开放排行缓存) + 上市日期(沪深交易所文件缓存)。
 
     数据为加法型字典列表(缺失即 None,由 C# 侧只填空回退)。
     """
-    establish_map = await EstablishDateProvider().get_all()
-    szse_list_map = await SzseListingDateSource().fetch_listing_dates()
-    sse_rows = await SseFundListSource().fetch_funds()
+    if establish_provider is None:
+        establish_provider = EstablishDateProvider()
+    if listing_provider is None:
+        listing_provider = ListingDateProvider()
+
+    establish_map = await establish_provider.get_all(force=force)
+    listing_dates = await listing_provider.get_all(force=force)
+    sh_list_map = listing_dates.get("SH", {})
+    sz_list_map = listing_dates.get("SZ", {})
 
     date_items: Dict[str, Dict[str, Optional[str]]] = {}
 
@@ -184,18 +193,14 @@ async def collect_fund_dates() -> List[Dict[str, Optional[str]]]:
 
     for code, value in establish_map.items():
         _touch(code)["establish_date"] = value
-    for code, value in szse_list_map.items():
+    for code, value in sz_list_map.items():
         _touch(code)["list_date"] = value
-    for row in sse_rows:
-        code = row.get("fund_code")
-        list_date = row.get("list_date")
-        if code and list_date:
-            _touch(code)["list_date"] = list_date
+    for code, value in sh_list_map.items():
+        _touch(code)["list_date"] = value
 
-    sse_list_count = sum(1 for r in sse_rows if r.get("list_date"))
     logger.info(
         f"collected fund dates: {len(date_items)} funds "
-        f"(establish={len(establish_map)}, list_date szse={len(szse_list_map)} sse={sse_list_count})")
+        f"(establish={len(establish_map)}, list_date szse={len(sz_list_map)} sse={len(sh_list_map)})")
     return list(date_items.values())
 
 
@@ -203,18 +208,26 @@ async def collect_fund_dates() -> List[Dict[str, Optional[str]]]:
 collect_fund_profiles = collect_fund_dates
 
 
-async def get_fund_dates(code: str) -> Dict[str, Optional[str]]:
+async def get_fund_dates(
+    code: str,
+    establish_provider: Optional[EstablishDateProvider] = None,
+    listing_provider: Optional[ListingDateProvider] = None,
+) -> Dict[str, Optional[str]]:
     """获取单只基金的关键日期汇总（成立日期与上市日期）。"""
     from core.filters import clean_fund_code
-    from providers.exchanges.listing_dates import ListingDateProvider
 
     clean = clean_fund_code(code)
     if not clean:
         return {"fund_code": code, "establish_date": None, "list_date": None}
 
-    establish_info = await EstablishDateProvider().get_one(clean)
+    if establish_provider is None:
+        establish_provider = EstablishDateProvider()
+    if listing_provider is None:
+        listing_provider = ListingDateProvider()
+
+    establish_info = await establish_provider.get_one(clean)
     try:
-        listing_info = await ListingDateProvider().get_one(clean)
+        listing_info = await listing_provider.get_one(clean)
     except Exception:
         listing_info = {"list_date": None}
 

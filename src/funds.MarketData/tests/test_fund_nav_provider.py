@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import shutil
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 import pytest
 
 from core.models import FundNav
@@ -71,3 +71,61 @@ async def test_source_selection():
     # 验证未知数据源抛出 ValueError
     with pytest.raises(ValueError, match="Unknown source"):
         await provider.get_fund_nav_history("510300", "2024-01-01", "2024-01-10", source="invalid_source")
+
+
+@pytest.mark.asyncio
+async def test_cmtidp_probe_success():
+    from providers.funds.cmtidp import CmtidpProbe
+
+    probe = CmtidpProbe()
+    with patch("providers.funds.cmtidp.CmtidpSource._fetch_page", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = {"iTotalRecords": 1, "aaData": [{"code": "000001"}]}
+        # 正常执行不抛异常
+        await probe.probe()
+        assert mock_fetch.call_count == 1
+        call_kwargs = mock_fetch.call_args.kwargs
+        assert call_kwargs["fund_code"] == "000001"
+        assert call_kwargs["start"] == 0
+        assert call_kwargs["length"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cmtidp_probe_failure():
+    from providers.funds.cmtidp import CmtidpProbe
+
+    probe = CmtidpProbe()
+    with patch("providers.funds.cmtidp.CmtidpSource._fetch_page", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = None
+        with pytest.raises(RuntimeError, match="unexpected response shape"):
+            await probe.probe()
+
+
+@pytest.mark.asyncio
+async def test_cmtidp_pagination_consistency():
+    from providers.funds.cmtidp import CmtidpSource
+
+    src = CmtidpSource()
+    # 构造 6 条标准 mock 上游数据
+    all_mock_rows = [
+        {"code": "510300", "valuationDate": f"2024-01-0{i}", "shareNetValue": f"3.5{i}", "totalNetValue": f"3.5{i}"}
+        for i in range(1, 7)
+    ]
+
+    async def mock_fetch_page(*, fund_code, start_date, end_date, start, length):
+        slice_rows = all_mock_rows[start : start + length]
+        return {"iTotalRecords": len(all_mock_rows), "aaData": slice_rows}
+
+    with patch.object(src, "_fetch_page", side_effect=mock_fetch_page):
+        # 1. 连续分页 3 次，每页 length=2 (start=0, 2, 4)
+        paged_rows = []
+        for offset in [0, 2, 4]:
+            data = await src._fetch_page(fund_code="510300", start_date="2024-01-01", end_date="2024-01-10", start=offset, length=2)
+            paged_rows.extend(data["aaData"])
+
+        # 2. 一次性获取 length=6 (start=0)
+        direct_data = await src._fetch_page(fund_code="510300", start_date="2024-01-01", end_date="2024-01-10", start=0, length=6)
+        direct_rows = direct_data["aaData"]
+
+        assert len(paged_rows) == 6
+        assert len(direct_rows) == 6
+        assert paged_rows == direct_rows
