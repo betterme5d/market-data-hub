@@ -7,7 +7,8 @@
 ```
 main.py              应用装配：日志、FastAPI 创建、路由挂载、探针注册、lifespan
 core/                横切能力（无业务）：config / cache / health / dispatcher /
-                     routing / filters / exceptions / models / calendar
+                     routing / filters / exceptions / models / calendar /
+                     timeseries_cache（通用时序 Parquet 增量缓存引擎）
 providers/           数据源实现（业务所在），按域分目录：
                      exchanges/ 交易所 · funds/ 基金 · quotes/ 行情 · misc/ 杂项
 routers/             HTTP 薄层：只做参数解析与异常包装，业务一律下沉到 provider
@@ -21,9 +22,9 @@ scripts/ tests/       工具与测试
 
 | 后缀     | 职责                                   | 业务取数 | 健康注册 | 示例                                    |
 | -------- | -------------------------------------- | -------- | -------- | --------------------------------------- |
-| Provider | 业务门面（对外消费入口，一域/交易所一个） | 有（组合） | 视需要 | `SseProvider` `SzseProvider`            |
-| Source   | 原子取数源（拉真实数据）                 | 有       | 无       | `SseFundListSource` `SzseCalendarSource` |
-| Probe    | 健康探针（只判断通不通/结构对不对）       | 无       | 是       | `SseFundListProbe` `HaoEtfProbe`        |
+| Provider | 业务门面（对外消费入口，一域/交易所一个） | 有（组合） | 视需要 | `FundNavProvider` `SseProvider`         |
+| Source   | 原子取数源（拉真实数据）                 | 有       | 无       | `EastmoneySource` `SseFundListSource`   |
+| Probe    | 健康探针（只判断通不通/结构对不对）       | 无       | 是       | `EastmoneyProbe` `CmtidpProbe`          |
 
 核心原则：
 
@@ -57,11 +58,10 @@ scripts/ tests/       工具与测试
 
 ## 4. 待决 / 已知漂移（不要在本轮顺带改）
 
-- 路由前缀统一：`/api` 与 `/api/v1`、裸路径并存，统一方案未定。
+- 路由前缀统一：`/api` 与 `/api/v1`、裸路径并存，新接口统一走 `/api/v1`，旧接口代理兼容。
 - quotes/ 四源走 `core.dispatcher` 熔断，与 `core.health` 双体系并行，待收敛。
 - `schemas/` 空目录与 `core/models.py` 归属待定。
-- `FundNavProvider`（base_nav.py 抽象）实为「净值取数能力接口」，属 Source 侧，
-  是否改名为 `FundNavSource` 待定（当前保持原名以控制改动范围）。
+- `base_nav.py` 抽象已规范为 `FundNavSource`，业务门面收敛至 `FundNavProvider`（位于 `fund_nav.py`）。
 
 ## 5. 禁止事项
 
