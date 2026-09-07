@@ -117,8 +117,8 @@ app = FastAPI(
     description="提供集成的行情代理与指数数据接口，支持实时报价、历史K线、申万行业指数、折溢价率以及公募基金数据查询。",
     version="1.1.0",
     lifespan=lifespan,
-    docs_url=None,
-    redoc_url=None,
+    docs_url="/docs",
+    redoc_url="/redoc",
 )
 
 if _otel_endpoint:
@@ -127,9 +127,9 @@ if _otel_endpoint:
     FastAPIInstrumentor.instrument_app(app)
 
 
-@app.get("/docs", include_in_schema=False)
+@app.get("/scalar", include_in_schema=False)
 async def scalar_docs() -> HTMLResponse:
-    """以 Scalar UI 呈现 OpenAPI 文档，取代默认 Swagger/ReDoc。"""
+    """以 Scalar UI 呈现 OpenAPI 文档。"""
     return get_scalar_api_reference(
         openapi_url=app.openapi_url,
         title="Market Data Proxy Service",
