@@ -55,6 +55,10 @@ class FundNav(BaseModel):
     nav_date: str  # 净值日期 (YYYY-MM-DD)
     unit_nav: Optional[float] = None  # 单位净值（份额净值）
     accum_nav: Optional[float] = None  # 累计净值
+    daily_return: Optional[float] = None  # 日增长率 (%)
+    subscribe_status: Optional[str] = None  # 申购状态
+    redeem_status: Optional[str] = None  # 赎回状态
+    dividend: Optional[str] = None  # 分红送配
 
 
 class FundNavResponse(BaseModel):

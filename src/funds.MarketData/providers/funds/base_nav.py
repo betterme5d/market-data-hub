@@ -10,7 +10,7 @@
 分页循环在 Source 内部消化，对外一次性返回标准 FundNav 列表。
 """
 from abc import ABC, abstractmethod
-from typing import List
+from typing import Awaitable, Callable, List, Optional
 
 from core.models import FundNav
 
@@ -27,9 +27,13 @@ class FundNavSource(ABC):
 
     @abstractmethod
     async def get_fund_nav_history(
-        self, code: str, start_date: str | None = None, end_date: str | None = None
+        self,
+        code: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        on_page: Optional[Callable[[List[FundNav], str, str], Awaitable[None]]] = None,
     ) -> List[FundNav]:
-        """获取单只基金在 [start_date, end_date] 内的历史净值（内部消化分页）。"""
+        """获取单只基金在 [start_date, end_date] 内的历史净值（内部消化分页，支持逐页流式回调）。"""
         raise NotImplementedError
 
 

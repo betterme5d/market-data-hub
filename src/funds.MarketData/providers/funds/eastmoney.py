@@ -2,11 +2,13 @@ import re
 import json
 import logging
 import asyncio
+import random
+from datetime import date, timedelta
+from typing import Awaitable, Callable, Dict, List, Any, Optional
 import requests
 import urllib3
 import httpx
 from bs4 import BeautifulSoup
-from typing import Dict, List, Any, Optional
 
 from core import config
 from core.models import FundNav
@@ -478,8 +480,9 @@ class EastmoneySource(FundNavProvider):
         page_size: int,
         start_date: str | None = None,
         end_date: str | None = None,
+        max_retries: int = 3,
     ) -> Optional[Dict[str, Any]]:
-        """请求单基金历史净值 lsjz 一页，返回 JSON（反爬要求 Referer + UA）。"""
+        """请求单基金历史净值 lsjz 一页，带重试与反爬头部。"""
         url = f"{config.EASTMONEY_F10_BASE_URL}/f10/lsjz"
         params: Dict[str, Any] = {
             "fundCode": fund_code,
@@ -494,23 +497,38 @@ class EastmoneySource(FundNavProvider):
             "User-Agent": _UA,
             "Referer": "http://fundf10.eastmoney.com/",
         }
-        try:
-            async with httpx.AsyncClient(
-                timeout=config.UPSTREAM_TIMEOUT, verify=False
-            ) as client:
-                resp = await client.get(url, params=params, headers=headers)
-                resp.raise_for_status()
-                return resp.json()
-        except Exception as e:
-            logger.error(f"Fetch lsjz failed for {fund_code} page {page_index}: {e}")
-            return None
+        for attempt in range(1, max_retries + 1):
+            try:
+                async with httpx.AsyncClient(
+                    timeout=config.UPSTREAM_TIMEOUT, verify=False
+                ) as client:
+                    resp = await client.get(url, params=params, headers=headers)
+                    resp.raise_for_status()
+                    return resp.json()
+            except Exception as e:
+                logger.warning(
+                    f"Fetch lsjz for {fund_code} page {page_index} attempt {attempt}/{max_retries} failed: {e}"
+                )
+                if attempt < max_retries:
+                    backoff = 0.2 * (2 ** (attempt - 1)) + random.uniform(0.05, 0.15)
+                    await asyncio.sleep(backoff)
+                else:
+                    logger.error(
+                        f"Fetch lsjz for {fund_code} page {page_index} exhausted all {max_retries} retries"
+                    )
+                    return None
 
     async def get_fund_nav_history(
-        self, code: str, start_date: str | None = None, end_date: str | None = None
+        self,
+        code: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        on_page: Optional[Callable[[List[FundNav], str, str], Awaitable[None]]] = None,
     ) -> List[FundNav]:
         """
         获取单只基金历史净值。内部 while 循环分页（pageSize 上限 20），
         日期区间直接透传上游（startDate/endDate）以减小分页量。
+        支持逐页流式回调 on_page(records, covered_start, covered_end)。
         Returns 按 nav_date 升序。
         """
         items: List[FundNav] = []
@@ -518,13 +536,24 @@ class EastmoneySource(FundNavProvider):
         seen = 0
         total = None
 
+        today_str = date.today().strftime("%Y-%m-%d")
+        yesterday_str = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        effective_upper = end_date
+        effective_lower = start_date
+
         while True:
+            # 延时防反爬（从第二页开始增加 200~400ms 随机抖动）
+            if page_index > 1:
+                await asyncio.sleep(random.uniform(0.2, 0.4))
+
             data = await self._fetch_lsjz_page(
                 code, page_index, _LSJZ_PAGE_SIZE, start_date, end_date
             )
             if data is None or str(data.get("ErrCode", "0")) != "0":
-                logger.warning(f"lsjz abnormal response for {code} page {page_index}: {str(data)[:200]}")
-                break
+                err_msg = f"lsjz abnormal response for {code} page {page_index}: {str(data)[:200]}"
+                logger.error(err_msg)
+                raise RuntimeError(err_msg)
 
             if total is None:
                 try:
@@ -533,21 +562,49 @@ class EastmoneySource(FundNavProvider):
                     total = 0
 
             lst = (data.get("Data") or {}).get("LSJZList") or []
+            page_items: List[FundNav] = []
             for row in lst:
                 nav_date = row.get("FSRQ")
                 if not nav_date:
                     continue
-                items.append(
+                page_items.append(
                     FundNav(
                         code=code,
                         nav_date=nav_date,
                         unit_nav=self._to_nav_float(row.get("DWJZ")),
                         accum_nav=self._to_nav_float(row.get("LJJZ")),
+                        daily_return=self._to_nav_float(row.get("JZZZL")),
+                        subscribe_status=row.get("SGZT") or None,
+                        redeem_status=row.get("SHZT") or None,
+                        dividend=row.get("FHSP") or None,
                     )
                 )
 
+            items.extend(page_items)
             seen += len(lst)
-            if not lst or (total and seen >= total) or len(lst) < _LSJZ_PAGE_SIZE:
+            is_last = (not lst) or (total is not None and seen >= total) or (len(lst) < _LSJZ_PAGE_SIZE)
+
+            # 只要每一页数据请求成功，立即执行 on_page 回调以即时落盘并更新覆盖区间
+            if on_page is not None:
+                # 检查第一页中是否包含今天，若未发布且请求包含今天，则上界剪裁至昨天
+                if page_index == 1 and effective_upper and effective_upper >= today_str:
+                    has_today = any(r.nav_date == today_str for r in page_items)
+                    if not has_today:
+                        effective_upper = min(effective_upper, yesterday_str)
+
+                if not page_items:
+                    # 空列表代表该区间在上游完全没有净值数据（如法定节假日或新基金未成立）
+                    if effective_lower and effective_upper and effective_lower <= effective_upper:
+                        await on_page([], effective_lower, effective_upper)
+                else:
+                    page_min_date = min(r.nav_date for r in page_items)
+                    # 最后一页时，覆盖下界延伸至请求起始日期 effective_lower
+                    cov_s = effective_lower if (is_last and effective_lower) else page_min_date
+                    cov_e = effective_upper or max(r.nav_date for r in page_items)
+                    if cov_s <= cov_e:
+                        await on_page(page_items, cov_s, cov_e)
+
+            if is_last:
                 break
             page_index += 1
 

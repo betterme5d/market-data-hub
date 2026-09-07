@@ -7,7 +7,7 @@
 import json
 import logging
 import time
-from typing import List, Optional
+from typing import Awaitable, Callable, List, Optional
 from urllib.parse import quote
 
 import httpx
@@ -197,7 +197,11 @@ class CmtidpSource(FundNavProvider):
         return items
 
     async def get_fund_nav_history(
-        self, code: str, start_date: str | None = None, end_date: str | None = None
+        self,
+        code: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        on_page: Optional[Callable[[List[FundNav], str, str], Awaitable[None]]] = None,
     ) -> List[FundNav]:
         """获取单只基金历史净值（跨天范围，内部 while 分页）。"""
         from datetime import date

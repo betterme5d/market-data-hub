@@ -3,6 +3,7 @@
 时序增量缓存系统门面：负责并发协程锁、增量切片调度、T日未发布延迟保护与落盘协同。
 """
 import asyncio
+import inspect
 import logging
 import time
 from datetime import date, datetime, timedelta
@@ -96,45 +97,76 @@ class TimeSeriesCacheManager:
                 effective_missing.append((s_slice, e_slice))
 
             if effective_missing:
-                new_records: List[Dict[str, Any]] = []
-                new_intervals_to_merge = []
-
                 for s_slice, e_slice in effective_missing:
-                    chunk = await fetch_fn(s_slice, e_slice)
-                    if chunk:
-                        new_records.extend(chunk)
+                    chunk_called = False
 
-                    # 检查 chunk 中是否包含今天的记录
-                    has_today = any(str(r.get(date_column)) == today_str for r in (chunk or []))
+                    async def _on_chunk(
+                        chunk_records: List[Dict[str, Any]], cov_s: str, cov_e: str
+                    ) -> None:
+                        nonlocal chunk_called, intervals
+                        chunk_called = True
+                        if chunk_records:
+                            self.storage.write_records(
+                                namespace,
+                                key,
+                                chunk_records,
+                                date_column=date_column,
+                                dimensions=dimensions,
+                            )
+                        # 检查今日未发布保护
+                        if cov_e < today_str and e_slice >= today_str:
+                            self._mark_today_pending(lock_key)
 
-                    # 如果当前切片延伸到了今天，但上游并没有返回今天的有效数据
-                    if e_slice >= today_str and not has_today:
-                        self._mark_today_pending(lock_key)
-                        # 仅把昨天及更早的部分作为已覆盖区间合并
-                        if s_slice <= yesterday_str:
-                            new_intervals_to_merge.append((s_slice, min(e_slice, yesterday_str)))
+                        intervals = self.tracker.merge_intervals(intervals, (cov_s, cov_e))
+                        meta["key"] = key
+                        meta["namespace"] = namespace
+                        if dimensions:
+                            meta["dimensions"] = dimensions
+                        meta["intervals"] = intervals
+                        meta["date_column"] = date_column
+                        meta["updated_at"] = datetime.now().isoformat()
+                        self.storage.write_metadata(
+                            namespace, key, meta, dimensions=dimensions
+                        )
+
+                    sig = inspect.signature(fetch_fn)
+                    if "on_chunk" in sig.parameters:
+                        chunk = await fetch_fn(s_slice, e_slice, on_chunk=_on_chunk)
                     else:
-                        new_intervals_to_merge.append((s_slice, e_slice))
+                        chunk = await fetch_fn(s_slice, e_slice)
 
-                if new_records:
-                    row_count = self.storage.write_records(
-                        namespace, key, new_records, date_column=date_column, dimensions=dimensions
-                    )
-                else:
-                    row_count = meta.get("row_count", 0)
+                    # 回退机制：若 fetch_fn 未触发 _on_chunk，执行全切片整体落盘
+                    if not chunk_called:
+                        if chunk:
+                            self.storage.write_records(
+                                namespace,
+                                key,
+                                chunk,
+                                date_column=date_column,
+                                dimensions=dimensions,
+                            )
+                        has_today = any(
+                            str(r.get(date_column)) == today_str for r in (chunk or [])
+                        )
+                        if e_slice >= today_str and not has_today:
+                            self._mark_today_pending(lock_key)
+                            if s_slice <= yesterday_str:
+                                intervals = self.tracker.merge_intervals(
+                                    intervals, (s_slice, min(e_slice, yesterday_str))
+                                )
+                        else:
+                            intervals = self.tracker.merge_intervals(intervals, (s_slice, e_slice))
 
-                for it in new_intervals_to_merge:
-                    intervals = self.tracker.merge_intervals(intervals, it)
-
-                meta["key"] = key
-                meta["namespace"] = namespace
-                if dimensions:
-                    meta["dimensions"] = dimensions
-                meta["intervals"] = intervals
-                meta["row_count"] = row_count
-                meta["date_column"] = date_column
-                meta["updated_at"] = datetime.now().isoformat()
-                self.storage.write_metadata(namespace, key, meta, dimensions=dimensions)
+                        meta["key"] = key
+                        meta["namespace"] = namespace
+                        if dimensions:
+                            meta["dimensions"] = dimensions
+                        meta["intervals"] = intervals
+                        meta["date_column"] = date_column
+                        meta["updated_at"] = datetime.now().isoformat()
+                        self.storage.write_metadata(
+                            namespace, key, meta, dimensions=dimensions
+                        )
 
             return self.storage.read_records(
                 namespace,
