@@ -9,10 +9,11 @@ from fastapi import APIRouter, HTTPException, Path, Query
 from core.models import FundNavResponse
 from providers.exchanges.exchange import ExchangeProvider
 from providers.exchanges.listing_dates import ListingDateProvider
-from providers.funds.base_nav import FundNavProvider
+from providers.funds.base_nav import FundNavSource
 from providers.funds.cmtidp import CmtidpSource
 from providers.funds.eastmoney import EastmoneySource
 from providers.funds.establish_dates import EstablishDateProvider
+from providers.funds.fund_nav import FundNavProvider
 from providers.funds.fund_profile import (
     EastmoneyProfileSource,
     collect_fund_dates,
@@ -29,9 +30,10 @@ exchange_provider = ExchangeProvider()
 eastmoney_profile_provider = EastmoneyProfileSource()
 listing_date_provider = ListingDateProvider()
 establish_date_provider = EstablishDateProvider()
+fund_nav_provider = FundNavProvider()
 
-# 净值数据源注册表：source -> FundNavProvider 实现
-_NAV_PROVIDERS: dict[str, FundNavProvider] = {
+# 净值数据源注册表：source -> FundNavSource 实现（兼容保留）
+_NAV_PROVIDERS: dict[str, FundNavSource] = {
     "eastmoney": eastmoney_provider,
     "cmtidp": CmtidpSource(),
 }
@@ -224,6 +226,48 @@ async def get_listing_date(code: str = Path(..., description="基金代码（6 �
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get(
+    "/api/v1/funds/{code}/navs",
+    response_model=FundNavResponse,
+    tags=["基金数据"],
+    summary="获取指定基金历史净值（带时序增量缓存）",
+)
+async def get_fund_navs(
+    code: str = Path(..., description="基金代码（6 位数字）"),
+    start_date: str = Query(..., description="起始日期 (YYYY-MM-DD)，必填"),
+    end_date: str = Query(..., description="结束日期 (YYYY-MM-DD)，必填"),
+    source: str | None = Query(None, description="数据源：eastmoney (默认) | cmtidp"),
+):
+    """
+    获取指定基金在 [start_date, end_date] 区间的历史净值列表。
+    内部接入通用时序 Parquet 增量缓存，具备闭合区间精准剪裁与 T 日未发布延迟保护。
+    """
+    clean_code = code.strip()
+    s_date = start_date.strip()
+    e_date = end_date.strip()
+
+    if not (len(clean_code) == 6 and clean_code.isdigit()):
+        raise HTTPException(status_code=400, detail=f"Invalid fund code: {code}, must be 6 digits")
+
+    if s_date > e_date:
+        raise HTTPException(
+            status_code=400,
+            detail=f"start_date ({s_date}) cannot be after end_date ({e_date})"
+        )
+
+    try:
+        items = await fund_nav_provider.get_fund_nav_history(
+            clean_code, start_date=s_date, end_date=e_date, source=source
+        )
+        resolved_source = (source or "eastmoney").strip().lower()
+        return FundNavResponse(source=resolved_source, count=len(items), items=items)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Failed to get fund navs for {code} ({s_date} ~ {e_date}): {e}")
+        raise HTTPException(status_code=502, detail=f"Get fund navs failed: {e}")
+
+
 @router.get("/api/fund-nav/latest", tags=["基金数据"], summary="获取最新一期全量基金净值")
 async def get_latest_all_nav(
     source: str = Query(..., description="数据源：cmtidp | eastmoney")
@@ -232,18 +276,23 @@ async def get_latest_all_nav(
     获取最新一期所有基金净值。各源"最新"语义：
     eastmoney 取当前最新交易日全量；cmtidp 取最新更新日全量。
     """
-    provider = _NAV_PROVIDERS.get(source.lower())
-    if provider is None:
-        raise HTTPException(status_code=400, detail=f"Unknown source: {source}")
     try:
-        items = await provider.get_latest_all_nav()
-        return FundNavResponse(source=source.lower(), count=len(items), items=items)
+        items = await fund_nav_provider.get_latest_all_nav(source=source)
+        return FundNavResponse(source=source.strip().lower(), count=len(items), items=items)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         logger.error(f"Get latest all nav failed for {source}: {e}")
         raise HTTPException(status_code=502, detail=f"{source} upstream failed: {e}")
 
 
-@router.get("/api/fund-nav/history", tags=["基金数据"], summary="获取指定基金历史净值")
+@router.get(
+    "/api/fund-nav/history",
+    response_model=FundNavResponse,
+    tags=["基金数据"],
+    summary="获取指定基金历史净值（旧接口别名，兼容用）",
+    deprecated=True,
+)
 async def get_fund_nav_history(
     source: str = Query(..., description="数据源：cmtidp | eastmoney"),
     code: str = Query(..., description="基金代码（6 位）"),
@@ -251,14 +300,14 @@ async def get_fund_nav_history(
     end_date: str | None = Query(None, description="结束日期 YYYY-MM-DD"),
 ):
     """
-    获取单只基金在 [start_date, end_date] 区间的逐日历史净值（升序）。
+    兼容旧端点，内部代理至带缓存的实现。
+    为避免上游密集翻页反爬熔断，必须显式提供 start_date 与 end_date。
     """
-    provider = _NAV_PROVIDERS.get(source.lower())
-    if provider is None:
-        raise HTTPException(status_code=400, detail=f"Unknown source: {source}")
-    try:
-        items = await provider.get_fund_nav_history(code, start_date, end_date)
-        return FundNavResponse(source=source.lower(), count=len(items), items=items)
-    except Exception as e:
-        logger.error(f"Get fund nav history failed for {source}/{code}: {e}")
-        raise HTTPException(status_code=502, detail=f"{source} upstream failed: {e}")
+    if not start_date or not end_date:
+        raise HTTPException(
+            status_code=400,
+            detail="Both start_date and end_date are required in YYYY-MM-DD format to prevent unbounded pagination."
+        )
+    return await get_fund_navs(
+        code=code, start_date=start_date, end_date=end_date, source=source
+    )
