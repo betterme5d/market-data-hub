@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 
 from core import config
 from core.models import FundNav
+from core.timeseries_cache.crawler import PageBatch, PaginatedSliceCrawler
 from providers.base import SourceProbe
 from providers.funds.base_nav import FundNavProvider
 
@@ -526,40 +527,33 @@ class EastmoneySource(FundNavProvider):
         on_page: Optional[Callable[[List[FundNav], str, str], Awaitable[None]]] = None,
     ) -> List[FundNav]:
         """
-        获取单只基金历史净值。内部 while 循环分页（pageSize 上限 20），
-        日期区间直接透传上游（startDate/endDate）以减小分页量。
-        支持逐页流式回调 on_page(records, covered_start, covered_end)。
+        获取单只基金历史净值。
+        使用通用 PaginatedSliceCrawler 统一处理分页循环、防反爬随机抖动、
+        单页指数退避重试与逐页流式落盘回调。
         Returns 按 nav_date 升序。
         """
-        items: List[FundNav] = []
-        page_index = 1
-        seen = 0
-        total = None
+        crawler = PaginatedSliceCrawler(
+            min_delay=0.2,
+            max_delay=0.4,
+            max_retries=3,
+        )
 
-        today_str = date.today().strftime("%Y-%m-%d")
-        yesterday_str = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
-
-        effective_upper = end_date
-        effective_lower = start_date
-
-        while True:
-            # 延时防反爬（从第二页开始增加 200~400ms 随机抖动）
-            if page_index > 1:
-                await asyncio.sleep(random.uniform(0.2, 0.4))
-
+        async def _fetch_single_page(
+            page_idx: int, page_sz: int, s_dt: Optional[str], e_dt: Optional[str]
+        ) -> PageBatch[FundNav]:
             data = await self._fetch_lsjz_page(
-                code, page_index, _LSJZ_PAGE_SIZE, start_date, end_date
+                code, page_idx, page_sz, s_dt, e_dt
             )
             if data is None or str(data.get("ErrCode", "0")) != "0":
-                err_msg = f"lsjz abnormal response for {code} page {page_index}: {str(data)[:200]}"
+                err_msg = f"lsjz abnormal response for {code} page {page_idx}: {str(data)[:200]}"
                 logger.error(err_msg)
                 raise RuntimeError(err_msg)
 
-            if total is None:
-                try:
-                    total = int(data.get("TotalCount", 0))
-                except (TypeError, ValueError):
-                    total = 0
+            total = None
+            try:
+                total = int(data.get("TotalCount", 0))
+            except (TypeError, ValueError):
+                total = 0
 
             lst = (data.get("Data") or {}).get("LSJZList") or []
             page_items: List[FundNav] = []
@@ -579,38 +573,17 @@ class EastmoneySource(FundNavProvider):
                         dividend=row.get("FHSP") or None,
                     )
                 )
+            return PageBatch(items=page_items, total_count=total)
 
-            items.extend(page_items)
-            seen += len(lst)
-            is_last = (not lst) or (total is not None and seen >= total) or (len(lst) < _LSJZ_PAGE_SIZE)
-
-            # 只要每一页数据请求成功，立即执行 on_page 回调以即时落盘并更新覆盖区间
-            if on_page is not None:
-                # 检查第一页中是否包含今天，若未发布且请求包含今天，则上界剪裁至昨天
-                if page_index == 1 and effective_upper and effective_upper >= today_str:
-                    has_today = any(r.nav_date == today_str for r in page_items)
-                    if not has_today:
-                        effective_upper = min(effective_upper, yesterday_str)
-
-                if not page_items:
-                    # 空列表代表该区间在上游完全没有净值数据（如法定节假日或新基金未成立）
-                    if effective_lower and effective_upper and effective_lower <= effective_upper:
-                        await on_page([], effective_lower, effective_upper)
-                else:
-                    page_min_date = min(r.nav_date for r in page_items)
-                    # 最后一页时，覆盖下界延伸至请求起始日期 effective_lower
-                    cov_s = effective_lower if (is_last and effective_lower) else page_min_date
-                    cov_e = effective_upper or max(r.nav_date for r in page_items)
-                    if cov_s <= cov_e:
-                        await on_page(page_items, cov_s, cov_e)
-
-            if is_last:
-                break
-            page_index += 1
-
-        # 升序（lsjz 默认按日期倒序返回，历史补全需要升序）
-        items.sort(key=lambda x: x.nav_date)
-        return items
+        return await crawler.crawl_slice(
+            start_date=start_date,
+            end_date=end_date,
+            page_size=_LSJZ_PAGE_SIZE,
+            fetch_page_fn=_fetch_single_page,
+            date_getter=lambda item: item.nav_date,
+            order="desc",
+            on_page=on_page,
+        )
 
     async def _fetch_jjjz_page(
         self, page_index: int, page_size: int

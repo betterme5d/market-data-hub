@@ -119,11 +119,11 @@ async def test_eastmoney_fetch_retry_and_partial_failure():
     async def mock_on_page(page_items, cov_s, cov_e):
         callback_calls.append((page_items, cov_s, cov_e))
 
-    # 将单页大小打桩为 1，第 1 页有 1 条，第 2 页失败 (None)
+    # 将单页大小打桩为 1，第 1 页有 1 条，第 2 页失败 (None)，支持 3 次重试
     with patch("providers.funds.eastmoney._LSJZ_PAGE_SIZE", 1), patch.object(
         source,
         "_fetch_lsjz_page",
-        side_effect=[page1_data, None],
+        side_effect=[page1_data, None, None, None],
     ), patch("asyncio.sleep", new_callable=AsyncMock):
         with pytest.raises(RuntimeError, match="lsjz abnormal response for 510300 page 2"):
             await source.get_fund_nav_history(

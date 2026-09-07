@@ -92,3 +92,12 @@ scripts/ tests/       工具与测试
    否则探测请求与业务请求各自漂移、测试覆盖不了。
 8. **上游偶发不稳定的兜底策略要显式**。对已知不稳定的接口（xlsx 截断、限频），
    在 Source 层显式处理（重试/校验），不指望调用方自己发现。
+
+## 7. 通用时序增量缓存系统 (`core.timeseries_cache`)
+
+用于基金历史净值、股票/指数K线、宏观指标等时序数据的本地持久化与增量同步：
+
+- **`IntervalTracker`**：纯闭区间拓扑差集计算与合并算法（求交、剪裁、合并）。
+- **`ParquetStorageEngine`**：基于 Apache Parquet 的列式存储，支持 Hive 风格多维目录隔离（`namespace/dim1=v1/.../key.parquet`）与原子 `.tmp` + `os.replace` 覆写。
+- **`TimeSeriesCacheManager`**：时序增量调度门面，提供标的级 `asyncio.Lock` 防并发穿透、T日未发布保护、以及逐页流式 `on_chunk` 写入。
+- **`PaginatedSliceCrawler`**：通用时序分页抓取器，统一封装自动翻页循环、页面间防反爬随机抖动休眠、单页异常指数退避重试、正序/倒序覆盖区间推导与逐页流式落盘回调。
