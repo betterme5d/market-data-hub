@@ -25,11 +25,8 @@ from providers.exchanges.szse import (
 )
 from providers.funds.cmtidp import CmtidpProbe
 from providers.funds.eastmoney import EastmoneyJjjzProbe, EastmoneyProbe
-from providers.funds.fund_profile import (
-    EastmoneyFbRankProbe,
-    EastmoneyProfileProbe,
-    SzseFundListingProbe,
-)
+from providers.funds.establish_dates import EastmoneyEstablishDateProbe
+from providers.funds.fund_profile import EastmoneyProfileProbe
 from providers.misc.cfets import CfetsProbe
 from routers import (
     akshare,
@@ -93,7 +90,7 @@ def _register_probes() -> None:
     """向健康体系注册各数据源的主动探针。"""
     probes = (
         CfetsProbe(), CmtidpProbe(), EastmoneyProbe(), EastmoneyJjjzProbe(),
-        EastmoneyFbRankProbe(), EastmoneyProfileProbe(), SzseFundListingProbe(),
+        EastmoneyEstablishDateProbe(), EastmoneyProfileProbe(),
         SzseWwwProbe(), SzseFundProbe(), SzseDocsProbe(), SzseDiscProbe(),
         SseQueryProbe(), SseYunhqProbe(), SseWwwProbe(),
         # 公开业务接口的语义化探针（站点可达 ≠ 接口仍可用）

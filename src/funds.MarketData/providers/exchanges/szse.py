@@ -3,6 +3,7 @@
 深交所各站点的健康探针与取数源（基金列表、官方交易日历 monthList）。
 """
 import logging
+import time
 from datetime import date, timedelta
 from typing import List, Optional, Tuple
 
@@ -154,73 +155,90 @@ class SzseCalendarSource:
 
 
 class SzseFundListProbe(SourceProbe):
-    """深交所 ETF/LOF 基金列表 ShowReport 接口的健康探针（复用 SzseFundListSource 同一取数/解析路径）。"""
+    """深交所基金产品列表 ShowReport（CATALOGID=1105）接口的健康探针。"""
 
     name = "szse-fund-list"
     category = "exchanges"
 
     async def probe(self) -> None:
-        """语义探针：走 Source 的真实解析路径取 ETF 报表，解析失败或空集即判失效。
+        """语义探针：走 Source 的真实解析路径全量拉取，解析失败或空集即判失效。
 
         探针不复制 URL/解析逻辑——否则探测请求与业务请求会漂移，探针绿而业务断。
         """
-        rows = await SzseFundListSource()._fetch_report(SzseFundListSource.ETF_URL, "ETF")
+        rows = await SzseFundListSource().fetch_funds()
         if not rows:
             raise RuntimeError("szse-fund-list probe: empty xlsx")
 
 
+# 1105「基金类别」→ 统一 fund_type 的归一映射（"不动产基金" 即公募 REITs）
+_FUND_TYPE_MAP = {
+    "ETF": "ETF",
+    "LOF": "LOF",
+    "不动产基金": "REIT",
+}
+
+
 class SzseFundListSource:
-    """深交所 ETF/LOF 基金列表取数源（ShowReport，xlsx）。"""
+    """深交所基金产品列表取数源（ShowReport CATALOGID=1105，xlsx）。
+
+    1105 全量覆盖 ETF/LOF/REITs（不动产基金），较旧的 1945（仅 ETF/LOF 两张表、
+    漏 28 只 REITs）信息更全，故列表与上市日期统一到 1105 单一数据源。
+    字段：基金代码、基金简称、基金类别、投资类别、上市日期、当前规模(份)、
+    基金管理人、发起人、托管人。
+    """
 
     EXCHANGE = "SZ"
-    ETF_URL = (
-        "https://www.szse.cn/api/report/ShowReport?SHOWTYPE=xlsx&CATALOGID=1945"
-        "&tab1PAGENO=1&random=0.6034564625944207&TABKEY=tab1"
-    )
-    LOF_URL = (
-        "https://www.szse.cn/api/report/ShowReport?SHOWTYPE=xlsx&CATALOGID=1945_LOF"
-        "&tab1PAGENO=1&random=0.6993308271523111&TABKEY=tab1"
+    # random 为深交所页面的缓存穿透参数（同 sse/cmtidp 的 _=时间戳，防 CDN 缓存旧表）
+    URL = (
+        "https://www.szse.cn/api/report/ShowReport?SHOWTYPE=xlsx"
+        "&CATALOGID=1105&TABKEY=tab1"
     )
 
-    async def _fetch_report(self, url: str, fund_type: str) -> list:
-        """请求一张 ShowReport xlsx 并解析（业务与探针共用同一代码路径）。"""
+    async def _fetch_report(self) -> list:
+        """请求 1105 报表并解析（业务与探针共用同一代码路径）。"""
+        url = f"{self.URL}&random={time.time()}"
         async with httpx.AsyncClient(verify=False) as client:
             resp = await client.get(url, timeout=30)
             if resp.status_code != 200:
                 return []
-            return self._parse_xlsx(resp.content, fund_type)
+            return self._parse_xlsx(resp.content)
 
     async def fetch_funds(self) -> list:
-        """获取深交所 ETF 与 LOF 基金列表。"""
-        results: list = []
-        for url, ftype in ((self.ETF_URL, "ETF"), (self.LOF_URL, "LOF")):
-            try:
-                results.extend(await self._fetch_report(url, ftype))
-            except Exception as e:
-                logger.error(f"Error fetching SZSE {ftype} funds: {e}")
-        return results
+        """获取深交所 ETF/LOF/REITs 基金列表（含上市日期）。"""
+        try:
+            return await self._fetch_report()
+        except Exception as e:
+            logger.error(f"Error fetching SZSE funds: {e}")
+            return []
 
-    def _parse_xlsx(self, content: bytes, fund_type: str) -> list:
-        """解析 ShowReport 返回的 xlsx：第 1 列代码、第 2 列名称。"""
+    def _parse_xlsx(self, content: bytes) -> list:
+        """解析 1105 xlsx：基金代码/简称/类别/上市日期，归一 fund_type。"""
         import io
 
         import pandas as pd
 
         rows = []
-        df = pd.read_excel(io.BytesIO(content), engine="openpyxl")
+        df = pd.read_excel(io.BytesIO(content), engine="openpyxl", dtype=object)
         for _, row in df.iterrows():
-            code = str(row.iloc[0]).strip()
-            name = str(row.iloc[1]).strip()
+            code = str(row.get("基金代码") or "").strip()
             if not code or code == "nan":
                 continue
             try:
                 code = str(int(float(code))).zfill(6)
             except (ValueError, TypeError):
                 code = code.zfill(6)
+            category = str(row.get("基金类别") or "").strip()
+            list_date_raw = row.get("上市日期")
+            list_date = None
+            if list_date_raw is not None:
+                text = str(list_date_raw).strip()
+                if text and text not in ("nan", "NaT", "None", "--", "-"):
+                    list_date = text[:10]
             rows.append({
                 "fund_code": code,
-                "fund_name": name,
-                "fund_type": fund_type,
+                "fund_name": str(row.get("基金简称") or "").strip(),
+                "fund_type": _FUND_TYPE_MAP.get(category, category or "OTHER"),
                 "exchange": self.EXCHANGE,
+                "list_date": list_date,
             })
         return rows

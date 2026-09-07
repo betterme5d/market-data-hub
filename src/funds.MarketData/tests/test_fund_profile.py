@@ -2,14 +2,15 @@
 """基金档案取数源(成立/上市日期)解析逻辑的 fixture 单测(不触网)。"""
 import os
 import sys
+import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from providers.exchanges.sse import _normalize_listing_date
+from providers.exchanges.szse import SzseFundListSource
 from providers.funds.fund_profile import (
     EastmoneyExchangeRankSource,
     EastmoneyProfileSource,
-    SzseFundListingSource,
     _normalize_date,
 )
 
@@ -44,9 +45,13 @@ def test_parse_eastmoney_exchange_rank():
 
 
 def test_parse_szse_fund_listing():
-    """SZSE 1000_lf 份额表 fixture:全量解析 + 上市日期实测值锚定。"""
+    """SZSE 基金产品列表 fixture(1105/1000_lf 同构):全量解析 + 上市日期实测值锚定。
+
+    数据源已统一到 1105（www.szse.cn 主站，覆盖 ETF/LOF/REITs）。
+    fixture 沿用旧 1000_lf 表（含净值列），解析取基金代码/简称/类别/上市日期。
+    """
     content = _load("szse_fund_list_scale.xlsx")
-    rows = SzseFundListingSource()._parse_xlsx(content)
+    rows = SzseFundListSource()._parse_xlsx(content)
     assert len(rows) >= 800
     by_code = {r["fund_code"]: r for r in rows}
     # 实测锚点:南方积配LOF 上市 2004-12-20、500ETF联接LOF 上市 2009-11-11
@@ -66,3 +71,23 @@ def test_parse_eastmoney_jbgk():
     html = _load("eastmoney_jbgk_161724.html").decode("utf-8")
     profile = EastmoneyProfileSource()._parse_html(html)
     assert profile["establish_date"] == "2015-05-20"
+
+
+@pytest.mark.asyncio
+async def test_get_fund_dates():
+    from unittest.mock import AsyncMock, patch
+    from providers.funds.fund_profile import get_fund_dates
+
+    with patch(
+        "providers.funds.establish_dates.EstablishDateProvider.get_one",
+        new=AsyncMock(return_value={"establish_date": "2012-05-04"}),
+    ), patch(
+        "providers.exchanges.listing_dates.ListingDateProvider.get_one",
+        new=AsyncMock(return_value={"list_date": "2012-05-28"}),
+    ):
+        res = await get_fund_dates("510300")
+        assert res == {
+            "fund_code": "510300",
+            "establish_date": "2012-05-04",
+            "list_date": "2012-05-28",
+        }
