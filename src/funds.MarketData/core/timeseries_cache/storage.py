@@ -107,9 +107,9 @@ class ParquetStorageEngine:
                     df = df[df[date_column] <= str(end_date)]
                 df = df.sort_values(by=[date_column], ascending=True)
 
-            # 将 NaN 替换为 None，便于序列化为 JSON
-            df_clean = df.where(pd.notnull(df), None)
-            return df_clean.to_dict(orient="records")
+            # 将 NaN / NaT 替换为标准 Python None，避免 Pydantic 校验与 JSON 序列化异常
+            raw_records = df.to_dict(orient="records")
+            return [{k: (None if pd.isna(v) else v) for k, v in r.items()} for r in raw_records]
         except Exception as e:
             logger.error(f"Failed to read parquet records from {p_path}: {e}")
             return []

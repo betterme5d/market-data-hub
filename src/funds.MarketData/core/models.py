@@ -1,4 +1,5 @@
-from pydantic import BaseModel, Field
+import math
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List
 from datetime import datetime
 
@@ -59,6 +60,28 @@ class FundNav(BaseModel):
     subscribe_status: Optional[str] = None  # 申购状态
     redeem_status: Optional[str] = None  # 赎回状态
     dividend: Optional[str] = None  # 分红送配
+
+    @field_validator("dividend", "subscribe_status", "redeem_status", mode="before")
+    @classmethod
+    def sanitize_str(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, float) and math.isnan(v):
+            return None
+        s = str(v).strip()
+        return s if s else None
+
+    @field_validator("unit_nav", "accum_nav", "daily_return", mode="before")
+    @classmethod
+    def sanitize_float(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, float) and math.isnan(v):
+            return None
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return None
 
 
 class FundNavResponse(BaseModel):
