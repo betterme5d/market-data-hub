@@ -65,11 +65,11 @@ async def lifespan(app: FastAPI):
         # 首次访问，打通会话
         try:
             logger.info("Navigating to xueqiu homepage...")
-            await page.goto("https://xueqiu.com/", wait_until="networkidle", timeout=15000)
+            await page.goto("https://xueqiu.com/", wait_until="domcontentloaded", timeout=15000)
             await asyncio.sleep(2)
             logger.info("Navigating to stock page to trigger xq_a_token...")
-            await page.goto("https://xueqiu.com/S/SH000001", wait_until="networkidle", timeout=15000)
-            await asyncio.sleep(3)
+            await page.goto("https://xueqiu.com/S/SH000001", wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(2)
         except Exception as e:
             logger.warning(f"Initial navigation to xueqiu homepage failed: {e}. Will retry on demand.")
             
@@ -133,6 +133,24 @@ async def get_xueqiu_auth(ua: str = None):
     default_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     target_ua = ua if ua else default_ua
 
+    # 优先检查持久化 context 是否已有有效 cookie
+    ctx = browser_context.get("context")
+    if ctx:
+        try:
+            cookies = await ctx.cookies()
+            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+            if "xq_a_token" in cookie_str:
+                logger.info("Reusing cookies from persistent browser context.")
+                return {
+                    "success": True,
+                    "cookie": cookie_str,
+                    "user_agent": target_ua,
+                    "cookies_raw": cookies,
+                    "debug_info": "reused persistent context"
+                }
+        except Exception as e:
+            logger.warning(f"Checking persistent context cookies failed: {e}")
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -172,12 +190,12 @@ async def get_xueqiu_auth(ua: str = None):
         try:
             # 第一步：先访问首页，建立基础会话
             logger.info("Step 1: Accessing xueqiu homepage...")
-            await page.goto("https://xueqiu.com/", wait_until="networkidle", timeout=30000)
+            await page.goto("https://xueqiu.com/", wait_until="domcontentloaded", timeout=15000)
             await asyncio.sleep(2)
 
             # 第二步：访问具体的股票页面，触发鉴权 Token 下发
             logger.info("Step 2: Accessing stock page...")
-            await page.goto("https://xueqiu.com/S/SH000001", wait_until="networkidle", timeout=30000)
+            await page.goto("https://xueqiu.com/S/SH000001", wait_until="domcontentloaded", timeout=15000)
             await asyncio.sleep(3)
 
             # 第三步：保存调试截图，看是否被验证码拦截
