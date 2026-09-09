@@ -14,6 +14,7 @@ from scalar_fastapi import get_scalar_api_reference
 
 from core import config
 from core import health as health_svc
+from core.middleware import CancelOnDisconnectMiddleware
 from providers.exchanges.sse import SseFundListProbe, SseQueryProbe, SseWwwProbe, SseYunhqProbe
 from providers.exchanges.szse import (
     SzseCalendarProbe,
@@ -123,6 +124,9 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
 )
+
+# 挂载客户端断开自动取消中间件：当客户端中断/取消请求时，秒级中断后台循环采集任务
+app.add_middleware(CancelOnDisconnectMiddleware)
 
 if _otel_endpoint:
     from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
