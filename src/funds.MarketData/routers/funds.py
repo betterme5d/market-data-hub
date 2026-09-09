@@ -6,7 +6,7 @@ import logging
 
 from fastapi import APIRouter, Header, HTTPException, Path, Query, Request
 
-from core.models import FundNavResponse
+from core.models import FundNavResponse, FundShareResponse
 from providers.exchanges.exchange import ExchangeProvider
 from providers.exchanges.listing_dates import ListingDateProvider
 from providers.funds.base_nav import FundNavSource
@@ -14,6 +14,7 @@ from providers.funds.cmtidp import CmtidpSource
 from providers.funds.eastmoney import EastmoneySource
 from providers.funds.establish_dates import EstablishDateProvider
 from providers.funds.fund_nav import FundNavProvider
+from providers.funds.shares.provider import fund_share_provider
 from providers.funds.fund_profile import (
     EastmoneyProfileSource,
     collect_fund_dates,
@@ -333,3 +334,47 @@ async def get_fund_nav_history(
     return await get_fund_navs(
         code=code, start_date=start_date, end_date=end_date, source=source
     )
+
+
+@router.get(
+    "/api/v1/funds/{code}/shares",
+    response_model=FundShareResponse,
+    tags=["基金数据"],
+    summary="获取指定基金历史份额（深交所全市场扇出时序缓存）",
+)
+async def get_fund_shares(
+    code: str = Path(..., description="基金代码（深市以 1 开头的 6 位代码）"),
+    start_date: str = Query(..., description="起始日期 (YYYY-MM-DD)"),
+    end_date: str = Query(..., description="结束日期 (YYYY-MM-DD)"),
+):
+    """
+    获取深市指定基金在 [start_date, end_date] 区间的逐日历史份额列表。
+    内部接入全市场扇出时序 Parquet 缓存，自动进行 <=60 天防截断分片并秒级预热全市场。
+    """
+    clean_code = code.strip()
+    s_date = start_date.strip()
+    e_date = end_date.strip()
+
+    if not (len(clean_code) == 6 and clean_code.isdigit()):
+        raise HTTPException(status_code=400, detail=f"Invalid fund code: {code}, must be 6 digits")
+
+    if not (clean_code.startswith("1") or clean_code.startswith("5")):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid fund code: {code}, must be 6 digits starting with '1' (SZSE) or '5' (SSE)"
+        )
+
+    resolved_exchange = "sse" if clean_code.startswith("5") else "szse"
+
+    if s_date > e_date:
+        raise HTTPException(
+            status_code=400,
+            detail=f"start_date ({s_date}) cannot be after end_date ({e_date})"
+        )
+
+    try:
+        items = await fund_share_provider.get_fund_shares(clean_code, s_date, e_date, exchange=resolved_exchange)
+        return FundShareResponse(code=clean_code, exchange=resolved_exchange, count=len(items), items=items)
+    except Exception as e:
+        logger.exception(f"Failed to get fund shares for {clean_code} ({s_date} ~ {e_date}): {e}")
+        raise HTTPException(status_code=502, detail=f"Get fund shares failed: {e}")

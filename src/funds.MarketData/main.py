@@ -27,6 +27,8 @@ from providers.funds.cmtidp import CmtidpProbe
 from providers.funds.eastmoney import EastmoneyJjjzProbe, EastmoneyProbe
 from providers.funds.establish_dates import EastmoneyEstablishDateProbe
 from providers.funds.fund_profile import EastmoneyProfileProbe
+from providers.exchanges.shares.sse import SseShareProbe
+from providers.exchanges.shares.szse import SzseShareProbe
 from providers.misc.cfets import CfetsProbe
 from routers import (
     akshare,
@@ -95,6 +97,7 @@ def _register_probes() -> None:
         SseQueryProbe(), SseYunhqProbe(), SseWwwProbe(),
         # 公开业务接口的语义化探针（站点可达 ≠ 接口仍可用）
         SseFundListProbe(), SzseFundListProbe(), SzseCalendarProbe(),
+        SzseShareProbe(), SseShareProbe(),
     )
     for provider in probes:
         health_svc.register_probe(provider.name, provider.category, provider.probe)

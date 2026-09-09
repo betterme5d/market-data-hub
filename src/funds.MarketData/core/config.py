@@ -56,3 +56,7 @@ HEALTH_PROBE_TIMEOUT = _get_float("HEALTH_PROBE_TIMEOUT", 5.0)
 
 # ---------- 透传请求的默认超时（秒） ----------
 UPSTREAM_TIMEOUT = _get_float("UPSTREAM_TIMEOUT", 30.0)
+
+# ---------- 基金份额数据源参数 ----------
+SSE_SHARE_MIN_DELAY = _get_float("SSE_SHARE_MIN_DELAY", 0.5)
+SSE_SHARE_MAX_DELAY = _get_float("SSE_SHARE_MAX_DELAY", 3.0)

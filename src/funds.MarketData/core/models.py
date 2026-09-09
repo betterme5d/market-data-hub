@@ -90,3 +90,51 @@ class FundNavResponse(BaseModel):
     source: str  # 实际数据源（回显）
     count: int  # 本批条数
     items: List[FundNav] = []
+
+
+class FundShare(BaseModel):
+    """统一基金份额单条记录（对齐交易所与 C# 实体结构）。"""
+
+    code: str  # 基金代码（6 位数字）
+    share_date: str  # 份额日期 (YYYY-MM-DD)
+    shares: Optional[float] = None  # 场内份额（单位：万份，对齐 C# 实体）
+    raw_shares: Optional[float] = None  # 原始份额（单位：份）
+    name: Optional[str] = None  # 基金简称
+
+    @field_validator("code", mode="before")
+    @classmethod
+    def sanitize_code(cls, v):
+        if v is None:
+            return ""
+        return str(v).strip()
+
+    @field_validator("shares", "raw_shares", mode="before")
+    @classmethod
+    def sanitize_shares(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, float) and math.isnan(v):
+            return None
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return None
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def sanitize_name(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, float) and math.isnan(v):
+            return None
+        s = str(v).strip()
+        return s if s else None
+
+
+class FundShareResponse(BaseModel):
+    """统一基金份额接口响应包装。"""
+
+    code: str  # 基金代码
+    exchange: str = "szse"  # 交易所标识 (szse | sse)
+    count: int  # 本批条数
+    items: List[FundShare] = []
