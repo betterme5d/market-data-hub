@@ -8,7 +8,7 @@ import logging
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from core.timeseries_cache.storage import ParquetStorageEngine
 from core.timeseries_cache.tracker import IntervalTracker
@@ -58,6 +58,27 @@ class TimeSeriesCacheManager:
     def _mark_today_pending(self, lock_key: str) -> None:
         self._pending_today[lock_key] = time.time()
 
+    @staticmethod
+    def _coalesce_slices(
+        slices: List[Sequence[str]],
+        can_coalesce: Callable[[str, str], bool],
+    ) -> List[Tuple[str, str]]:
+        """
+        贪心合并相邻缺失切片：从左到右把后续切片并进当前跨度，直到合并后不再满足 can_coalesce。
+
+        目的：减少上游请求次数。请求次数是风控敏感资源，而重复拉取中间已覆盖区间的代价
+        只是少量字节（落盘按日期去重，不会产生重复行），因此「宁少请求、勿多请求」。
+        跨度一旦超出单页容量就断开另起一段，避免把两次请求撑成三次。
+        """
+        merged: List[Tuple[str, str]] = [(str(slices[0][0]), str(slices[0][1]))]
+        for s_slice, e_slice in slices[1:]:
+            cand_start, cand_end = merged[-1][0], str(e_slice)
+            if can_coalesce(cand_start, cand_end):
+                merged[-1] = (cand_start, cand_end)
+            else:
+                merged.append((str(s_slice), cand_end))
+        return merged
+
     async def get_or_fetch(
         self,
         namespace: str,
@@ -67,14 +88,19 @@ class TimeSeriesCacheManager:
         fetch_fn: Callable[[str, str], Awaitable[List[Dict[str, Any]]]],
         date_column: str = "date",
         dimensions: Optional[Dict[str, str]] = None,
+        coalesce: Optional[Callable[[str, str], bool]] = None,
     ) -> List[Dict[str, Any]]:
         """
         核心读取/增量抓取方法：
         1. 获取细粒度协程锁；
         2. 读取 meta.json 算出缺失切片；
-        3. 对缺失切片调用 fetch_fn 拉取；
-        4. 应用 T日未发布保护，将数据写入 Parquet 并更新 intervals；
-        5. 返回请求日期范围内的全部记录。
+        3. 若提供 coalesce，贪心合并相邻缺失切片（减少上游请求次数）；
+        4. 对缺失切片调用 fetch_fn 拉取；
+        5. 应用 T日未发布保护，将数据写入 Parquet 并更新 intervals；
+        6. 返回请求日期范围内的全部记录。
+
+        :param coalesce: 可选策略回调，传入候选跨度 (start, end)，返回「合并后是否仍能一次取完」。
+            提供时对缺失切片做贪心合并；默认 None 保持逐切片拉取（不影响基金净值/份额等命名空间）。
         """
         lock_key = self._make_key(namespace, key, dimensions)
         lock = await self._get_lock(lock_key)
@@ -95,6 +121,10 @@ class TimeSeriesCacheManager:
                     logger.debug(f"{lock_key} today is pending within TTL, skipping fetch for today")
                     continue
                 effective_missing.append((s_slice, e_slice))
+
+            # 贪心合并相邻缺失切片：跨度仍装得下一页就并成一次请求（减少风控敏感的上游请求次数）
+            if coalesce is not None and len(effective_missing) > 1:
+                effective_missing = self._coalesce_slices(effective_missing, coalesce)
 
             if effective_missing:
                 for s_slice, e_slice in effective_missing:
@@ -129,8 +159,14 @@ class TimeSeriesCacheManager:
                             namespace, key, meta, dimensions=dimensions
                         )
 
-                    sig = inspect.signature(fetch_fn)
-                    if "on_chunk" in sig.parameters:
+                    has_on_chunk = False
+                    try:
+                        sig = inspect.signature(fetch_fn)
+                        has_on_chunk = "on_chunk" in sig.parameters
+                    except (TypeError, ValueError):
+                        has_on_chunk = False
+
+                    if has_on_chunk:
                         chunk = await fetch_fn(s_slice, e_slice, on_chunk=_on_chunk)
                     else:
                         chunk = await fetch_fn(s_slice, e_slice)

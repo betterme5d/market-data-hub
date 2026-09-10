@@ -241,3 +241,124 @@ async def test_streaming_chunk_persistence_and_breakpoint_resumption():
     assert [r["nav_date"] for r in res] == ["2024-03-05", "2024-03-20"]
     meta_final = manager.storage.read_metadata("fund_nav", "510300")
     assert meta_final["intervals"] == [["2024-03-01", "2024-03-31"]]
+
+
+async def _prefill_two_intervals(manager: TimeSeriesCacheManager, key: str = "510500"):
+    """预置两段缓存：[2026-01-01, 03-31] 与 [2026-05-01, 06-30]。"""
+    prefill = AsyncMock(return_value=[{"date": "2026-01-15", "close": 1.0}])
+    for s, e in [("2026-01-01", "2026-03-31"), ("2026-05-01", "2026-06-30")]:
+        await manager.get_or_fetch(
+            namespace="kline", key=key, start_date=s, end_date=e,
+            fetch_fn=prefill, date_column="date",
+        )
+    meta = manager.storage.read_metadata("kline", key)
+    assert meta["intervals"] == [["2026-01-01", "2026-03-31"], ["2026-05-01", "2026-06-30"]]
+
+
+@pytest.mark.asyncio
+async def test_coalesce_merges_gap_slices_into_single_fetch():
+    """提供 coalesce 时，多个缺口合并为一次上游请求（请求次数是风控敏感资源）。"""
+    manager = TimeSeriesCacheManager(base_dir=TEST_CACHE_DIR)
+    await _prefill_two_intervals(manager)
+
+    requested = []
+
+    async def fetch(s, e):
+        requested.append((s, e))
+        return [{"date": "2026-04-15", "close": 1.0}]
+
+    res = await manager.get_or_fetch(
+        namespace="kline", key="510500",
+        start_date="2026-02-01", end_date="2026-08-31",
+        fetch_fn=fetch, date_column="date",
+        coalesce=lambda s, e: True,
+    )
+
+    # 缺口 [04-01, 04-30] 与 [07-01, 08-31] 合并成一次请求
+    assert requested == [("2026-04-01", "2026-08-31")]
+    assert [r["date"] for r in res] == ["2026-04-15"]  # 2026-01-15 落在请求区间外，被读取过滤
+    # 中间已覆盖区间被顺带重拉，覆盖声明合并为完整一段
+    assert manager.storage.read_metadata("kline", "510500")["intervals"] == [["2026-01-01", "2026-08-31"]]
+
+
+@pytest.mark.asyncio
+async def test_coalesce_breaks_when_span_exceeds_limit():
+    """合并后超出单页容量时必须断开另起一段，不能把多次请求撑成更多次。"""
+    manager = TimeSeriesCacheManager(base_dir=TEST_CACHE_DIR)
+    await _prefill_two_intervals(manager)
+
+    requested = []
+    probed = []
+
+    async def fetch(s, e):
+        requested.append((s, e))
+        return [{"date": "2026-04-15", "close": 1.0}]
+
+    def can_coalesce(s, e):
+        probed.append((s, e))
+        return False  # 模拟「合并后跨度超过单页容量」
+
+    await manager.get_or_fetch(
+        namespace="kline", key="510500",
+        start_date="2026-02-01", end_date="2026-08-31",
+        fetch_fn=fetch, date_column="date", coalesce=can_coalesce,
+    )
+
+    assert probed == [("2026-04-01", "2026-08-31")]  # 只探测过一次候选跨度
+    assert requested == [("2026-04-01", "2026-04-30"), ("2026-07-01", "2026-08-31")]
+
+
+@pytest.mark.asyncio
+async def test_greedy_packing_respects_limit_per_span():
+    """贪心装箱：能并的先并满，超出上限才断开——缺口段数不等于请求次数。"""
+    manager = TimeSeriesCacheManager(base_dir=TEST_CACHE_DIR)
+    prefill = AsyncMock(return_value=[{"date": "2026-01-15", "close": 1.0}])
+    for s, e in [("2026-01-01", "2026-01-31"), ("2026-03-01", "2026-03-31"), ("2026-05-01", "2026-06-30")]:
+        await manager.get_or_fetch(
+            namespace="kline", key="600000", start_date=s, end_date=e,
+            fetch_fn=prefill, date_column="date",
+        )
+    assert manager.storage.read_metadata("kline", "600000")["intervals"] == [
+        ["2026-01-01", "2026-01-31"], ["2026-03-01", "2026-03-31"], ["2026-05-01", "2026-06-30"],
+    ]
+
+    requested = []
+
+    async def fetch(s, e):
+        requested.append((s, e))
+        return [{"date": "2026-02-15", "close": 1.0}]
+
+    def can_coalesce(s, e):
+        # 模拟单页容量上限：跨度不得超过 100 天
+        return (date.fromisoformat(e) - date.fromisoformat(s)).days <= 100
+
+    await manager.get_or_fetch(
+        namespace="kline", key="600000",
+        start_date="2026-01-01", end_date="2026-08-31",
+        fetch_fn=fetch, date_column="date", coalesce=can_coalesce,
+    )
+
+    # 三个缺口 [02-01,02-28] / [04-01,04-30] / [07-01,08-31]：
+    # 前两个并成 [02-01, 04-30]（88 天，未超限），并入第三个会达 211 天故断开
+    assert requested == [("2026-02-01", "2026-04-30"), ("2026-07-01", "2026-08-31")], requested
+
+
+@pytest.mark.asyncio
+async def test_without_coalesce_keeps_per_slice_fetch():
+    """默认不合并：存量命名空间（基金净值/份额）行为完全不变。"""
+    manager = TimeSeriesCacheManager(base_dir=TEST_CACHE_DIR)
+    await _prefill_two_intervals(manager)
+
+    requested = []
+
+    async def fetch(s, e):
+        requested.append((s, e))
+        return [{"date": "2026-04-15", "close": 1.0}]
+
+    await manager.get_or_fetch(
+        namespace="kline", key="510500",
+        start_date="2026-02-01", end_date="2026-08-31",
+        fetch_fn=fetch, date_column="date",
+    )
+
+    assert requested == [("2026-04-01", "2026-04-30"), ("2026-07-01", "2026-08-31")]

@@ -65,8 +65,14 @@ class FundNavProvider:
                     page_dicts = [item.model_dump() for item in page_items]
                     await on_chunk(page_dicts, cov_s, cov_e)
 
-            sig = inspect.signature(src_obj.get_fund_nav_history)
-            if "on_page" in sig.parameters:
+            has_on_page = False
+            try:
+                sig = inspect.signature(src_obj.get_fund_nav_history)
+                has_on_page = "on_page" in sig.parameters
+            except (TypeError, ValueError):
+                has_on_page = False
+
+            if has_on_page:
                 items = await src_obj.get_fund_nav_history(
                     norm_code, start_date=s, end_date=e, on_page=_on_page_cb
                 )

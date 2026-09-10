@@ -3,6 +3,7 @@ import asyncio
 import os
 import shutil
 import tempfile
+from datetime import date, datetime, timedelta
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
@@ -10,6 +11,14 @@ from providers.quotes.xueqiu import XueqiuProvider
 from core.timeseries_cache.manager import TimeSeriesCacheManager
 from core.timeseries_cache.storage import ParquetStorageEngine
 from core.timeseries_cache.tracker import IntervalTracker
+
+
+def _ts(y, m, d):
+    """构造当日 12:00 的毫秒时间戳，避免解析回本地日期时跨日。"""
+    return int(datetime(y, m, d, 12, 0, 0).timestamp() * 1000)
+
+
+KLINE_COLUMNS = ["timestamp", "volume", "open", "high", "low", "close", "chg", "percent", "turnoverrate", "amount"]
 
 
 @pytest.fixture
@@ -152,3 +161,160 @@ async def test_xueqiu_kline_parquet_cache_integration(temp_cache_dir, monkeypatc
     assert len(res2["data"]) == 2
     assert res2["data"][0]["date"] == "2026-01-02"
     assert res2["data"][1]["date"] == "2026-01-05"
+
+
+@pytest.mark.asyncio
+async def test_small_window_uses_weekday_count_single_page(monkeypatch):
+    """小窗口：count 按区间工作日数下发（不再固定 5000），且窗口起始日落在周末时也能单页收敛。
+
+    2026-01-04 是周日：最早 K 线日期（01-05）必然晚于 slice_start，
+    只能靠「估算未被上限截断」这条终止依据收敛，否则会多发一次翻页请求。
+    """
+    provider = XueqiuProvider()
+    monkeypatch.setattr(provider, "_ensure_cookie", AsyncMock(return_value=("fake_cookie", "fake_ua")))
+
+    # 2026-01-05(周一) ~ 2026-01-16(周五) 共 10 个交易日
+    items = [
+        [_ts(2026, 1, d), 100, 1.0, 1.1, 0.9, 1.05, 0.05, 5.0, 1.0, 1000.0]
+        for d in [5, 6, 7, 8, 9, 12, 13, 14, 15, 16]
+    ]
+
+    requested_counts = []
+
+    async def mock_get(url, headers, timeout=None):
+        import urllib.parse
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(str(url)).query)
+        requested_counts.append(int(qs["count"][0]))
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"error_code": 0, "data": {"column": KLINE_COLUMNS, "item": items}}
+        return mock_resp
+
+    slept = []
+
+    async def mock_sleep(sec):
+        slept.append(sec)
+
+    monkeypatch.setattr(asyncio, "sleep", mock_sleep)
+
+    with patch("httpx.AsyncClient.get", side_effect=mock_get):
+        chunk_calls = []
+
+        async def on_chunk(records, s_date, e_date):
+            chunk_calls.append((len(records), s_date, e_date))
+
+        records = await provider._fetch_kline_slice(
+            symbol="SH510300",
+            slice_start="2026-01-04",
+            slice_end="2026-01-16",
+            period_str="day",
+            adjust_type="before",
+            on_chunk=on_chunk,
+        )
+
+    assert requested_counts == [-10]  # 10 个工作日，而非固定 5000
+    assert len(records) == 10
+    assert len(chunk_calls) == 1
+    assert chunk_calls[0] == (10, "2026-01-04", "2026-01-16")  # 覆盖区间对齐整个窗口
+    assert slept == []  # 单页收敛，无翻页延时
+
+
+@pytest.mark.asyncio
+async def test_weekend_only_window_skips_network(monkeypatch):
+    """纯周末窗口必然无 K 线：不发任何网络请求，也不触发 on_chunk（由缓存管理器标记区间覆盖）。"""
+    provider = XueqiuProvider()
+    monkeypatch.setattr(provider, "_ensure_cookie", AsyncMock(return_value=("fake_cookie", "fake_ua")))
+
+    async def forbidden_get(url, headers, timeout=None):
+        raise AssertionError(f"纯周末窗口不应发起网络请求，但请求了: {url}")
+
+    with patch("httpx.AsyncClient.get", side_effect=forbidden_get):
+        chunk_calls = []
+
+        async def on_chunk(records, s_date, e_date):
+            chunk_calls.append((len(records), s_date, e_date))
+
+        records = await provider._fetch_kline_slice(
+            symbol="SH510300",
+            slice_start="2026-09-05",  # 周六
+            slice_end="2026-09-06",    # 周日
+            period_str="day",
+            adjust_type="before",
+            on_chunk=on_chunk,
+        )
+
+    assert records == []
+    assert chunk_calls == []
+
+
+def _mock_get_returning(days: list, columns: list):
+    async def mock_get(url, headers, timeout=None):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "error_code": 0,
+            "data": {"column": columns, "item": [[_ts(*d), 100, 1.0, 1.1, 0.9, 1.05, 0.05, 5.0, 1.0, 1000.0] for d in days]},
+        }
+        return mock_resp
+    return mock_get
+
+
+@pytest.mark.asyncio
+async def test_today_bar_is_not_frozen_in_coverage(monkeypatch):
+    """覆盖到今天的切片：覆盖声明只到昨天，避免盘中半日 K 线被固化成「今天已就绪」。"""
+    provider = XueqiuProvider()
+    monkeypatch.setattr(provider, "_ensure_cookie", AsyncMock(return_value=("fake_cookie", "fake_ua")))
+
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    days = [(yesterday.year, yesterday.month, yesterday.day), (today.year, today.month, today.day)]
+
+    with patch("httpx.AsyncClient.get", side_effect=_mock_get_returning(days, KLINE_COLUMNS)):
+        chunk_calls = []
+
+        async def on_chunk(records, s_date, e_date):
+            chunk_calls.append((len(records), s_date, e_date))
+
+        await provider._fetch_kline_slice(
+            symbol="SH510300",
+            slice_start=(today - timedelta(days=5)).strftime("%Y-%m-%d"),
+            slice_end=today.strftime("%Y-%m-%d"),
+            period_str="day",
+            adjust_type="normal",
+            on_chunk=on_chunk,
+        )
+
+    assert len(chunk_calls) == 1
+    assert chunk_calls[0][2] == yesterday.strftime("%Y-%m-%d")  # 声明到昨天，不含今天
+
+
+@pytest.mark.asyncio
+async def test_today_only_slice_does_not_claim_today(monkeypatch):
+    """切片仅含今天一天时，不得把今天声明为已覆盖（否则回退分支会固化它）。"""
+    today = date.today()
+    if today.weekday() >= 5:
+        pytest.skip("今天不是工作日，单日窗口无 K 线")
+    provider = XueqiuProvider()
+    monkeypatch.setattr(provider, "_ensure_cookie", AsyncMock(return_value=("fake_cookie", "fake_ua")))
+
+    today_str = today.strftime("%Y-%m-%d")
+    yesterday_str = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    with patch("httpx.AsyncClient.get", side_effect=_mock_get_returning([(today.year, today.month, today.day)], KLINE_COLUMNS)):
+        chunk_calls = []
+
+        async def on_chunk(records, s_date, e_date):
+            chunk_calls.append((len(records), s_date, e_date))
+
+        await provider._fetch_kline_slice(
+            symbol="SH510300",
+            slice_start=today_str,
+            slice_end=today_str,
+            period_str="day",
+            adjust_type="normal",
+            on_chunk=on_chunk,
+        )
+
+    assert len(chunk_calls) == 1
+    assert today_str not in chunk_calls[0][1:]
+    assert chunk_calls[0][1:] == (yesterday_str, yesterday_str)

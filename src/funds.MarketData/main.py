@@ -36,6 +36,7 @@ from routers import (
     calendar,
     funds,
     health,
+    kline,
     premium,
     quotes,
     sws,
@@ -49,38 +50,44 @@ logger = logging.getLogger(__name__)
 # 持续剖析（仅测试环境：dev compose 注入 PYROSCOPE_SERVER_ADDRESS；生产不注入则跳过）
 _pyroscope_server = os.getenv("PYROSCOPE_SERVER_ADDRESS")
 if _pyroscope_server:
-    import pyroscope
+    try:
+        import pyroscope
 
-    pyroscope.configure(
-        application_name="funds-marketdata",
-        server_address=_pyroscope_server,
-    )
-    logger.info("Pyroscope profiling enabled -> %s", _pyroscope_server)
+        pyroscope.configure(
+            application_name="funds-marketdata",
+            server_address=_pyroscope_server,
+        )
+        logger.info("Pyroscope profiling enabled -> %s", _pyroscope_server)
+    except ImportError:
+        logger.warning("pyroscope-io not installed, profiling disabled (set PYROSCOPE_SERVER_ADDRESS only in container env)")
 
 # 分布式追踪（仅测试环境：dev compose 注入 OTEL_EXPORTER_OTLP_ENDPOINT；生产不注入则跳过）
 # 入站 FastAPI span 会提取上游（webapi）透传的 traceparent，出站 httpx 自动注入 traceparent 给下游（gateway/上游数据源）
 _otel_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 if _otel_endpoint:
-    from opentelemetry import trace
-    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
-    from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
-    from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
+    try:
+        from opentelemetry import trace
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
 
-    # 生产可用 OTEL_TRACES_SAMPLER_ARG 控制采样比例（0.1 = 采 10%），不设则全量
-    _tracer_provider = TracerProvider(
-        resource=Resource.create({"service.name": "funds-marketdata"}),
-        sampler=ParentBased(TraceIdRatioBased(float(os.getenv("OTEL_TRACES_SAMPLER_ARG", "1")))),
-    )
-    _tracer_provider.add_span_processor(
-        BatchSpanProcessor(OTLPSpanExporter(endpoint=f"{_otel_endpoint.rstrip('/')}/v1/traces"))
-    )
-    trace.set_tracer_provider(_tracer_provider)
-    HTTPXClientInstrumentor().instrument()
-    logger.info("OTel tracing enabled -> %s", _otel_endpoint)
+        # 生产可用 OTEL_TRACES_SAMPLER_ARG 控制采样比例（0.1 = 采 10%），不设则全量
+        _tracer_provider = TracerProvider(
+            resource=Resource.create({"service.name": "funds-marketdata"}),
+            sampler=ParentBased(TraceIdRatioBased(float(os.getenv("OTEL_TRACES_SAMPLER_ARG", "1")))),
+        )
+        _tracer_provider.add_span_processor(
+            BatchSpanProcessor(OTLPSpanExporter(endpoint=f"{_otel_endpoint.rstrip('/')}/v1/traces"))
+        )
+        trace.set_tracer_provider(_tracer_provider)
+        HTTPXClientInstrumentor().instrument()
+        logger.info("OTel tracing enabled -> %s", _otel_endpoint)
+    except ImportError as e:
+        logger.warning("OpenTelemetry package incomplete, tracing disabled: %s", e)
 
 if config.DEBUG:
     logging.getLogger("providers").setLevel(logging.DEBUG)
@@ -129,9 +136,12 @@ app = FastAPI(
 app.add_middleware(CancelOnDisconnectMiddleware)
 
 if _otel_endpoint:
-    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    try:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
-    FastAPIInstrumentor.instrument_app(app)
+        FastAPIInstrumentor.instrument_app(app)
+    except ImportError:
+        pass
 
 
 @app.get("/docs", include_in_schema=False)
@@ -150,6 +160,7 @@ app.include_router(akshare.router)
 app.include_router(sws.router)
 app.include_router(calendar.router)
 app.include_router(xueqiu_gw.router)
+app.include_router(kline.router)
 
 
 if __name__ == "__main__":

@@ -53,6 +53,14 @@ def translate_standard_symbol(symbol: str) -> Dict[str, str]:
                 "sina": f"rt_hk{padded_code}",
                 "xueqiu": padded_code
             }
+        elif suffix == "US":
+            # 系统标准码带 .US 后缀，但雪球/新浪等源用裸代码（AAPL），带点前缀的（.SPGSCL）另走原生透传
+            return {
+                "yfinance": code,
+                "xueqiu": code,
+                "sina": f"gb_{code.lower()}",
+                "tencent": f"us{code}",
+            }
 
     # 3. 常见美股标的代码 (2-5位英文字母)
     if symbol_upper.isalpha() and 2 <= len(symbol_upper) <= 5:

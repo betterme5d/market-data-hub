@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 import httpx
 
 from core import config
+from core.bar_estimator import MAX_PAGE_SIZE, estimate_bar_count
 from core.exceptions import BusinessException
 from core.models import UnifiedQuote
 from core.routing import translate_standard_symbol
@@ -19,7 +20,9 @@ logger = logging.getLogger(__name__)
 
 def normalize_xueqiu_symbol(symbol: str) -> str:
     """
-    将输入代码转换为雪球专有格式，如 510050.SH -> SH510050，000001.SZ -> SZ000001
+    将输入代码转换为雪球专有格式，如 510050.SH -> SH510050，000001.SZ -> SZ000001，
+    00700.HK -> 00700，AAPL.US -> AAPL（雪球用裸代码）。
+    原生符号（HKHSI / CSI930875 / .SPGSCL / HKDCNY.FX）原样透传。
     """
     mapping = translate_standard_symbol(symbol)
     if "xueqiu" in mapping:
@@ -30,6 +33,9 @@ def normalize_xueqiu_symbol(symbol: str) -> str:
             return f"SH{code}"
         elif suffix == "SZ":
             return f"SZ{code}"
+        elif suffix == "US":
+            # 前缀分支会先吞掉 HKHSI.US 这类以 hk 开头的输入，故此处兜底再剥一次 .US
+            return code
     return symbol.upper()
 
 
@@ -87,7 +93,7 @@ class XueqiuProvider(BaseProvider):
         try:
             async with httpx.AsyncClient(timeout=5, verify=False) as client:
                 headers = {"User-Agent": self.default_ua}
-                resp = await client.get("https://xueqiu.com/", headers=headers)
+                resp = await client.get("https://xueqiu.com/about", headers=headers)
                 cookies_list = []
                 for name, value in resp.cookies.items():
                     cookies_list.append(f"{name}={value}")
@@ -270,13 +276,21 @@ class XueqiuProvider(BaseProvider):
     ) -> List[Dict[str, Any]]:
         """
         向前倒序自动翻页拉取指定切片区间的雪球 K 线：
-        - 单页固定容量 count = -5000；
+        - 单页容量按窗口自适应：取 min(区间根数上界, MAX_PAGE_SIZE)，小窗口不再固定拉满 5000 根；
         - 每获取一页立即触发 on_chunk 写入 Parquet 并合并已覆盖区间；
-        - 终止条件：len(items) < 5000（触底到头）或最早日期 <= slice_start；
+        - 终止条件：未满页（触底到头）/ 最早日期 <= slice_start（已回到窗口左界）/
+          单页装满且估算未被上限截断（窗口根数上界已被一页取完）；
         - 翻页间隙随机休眠 2~5 秒防风控。
         """
         upper_symbol = normalize_xueqiu_symbol(symbol)
-        page_count = 5000
+
+        # 单页根数按窗口自适应：区间根数上界即覆盖窗口所需的最大根数，超过 MAX_PAGE_SIZE 才翻页
+        est = estimate_bar_count(slice_start, slice_end, period_str)
+        if est == 0:
+            logger.info(f"Xueqiu KLine slice {slice_start}~{slice_end} contains no weekday, skip fetching.")
+            return []
+        page_count = min(est, MAX_PAGE_SIZE)
+
         end_dt = datetime.strptime(slice_end, "%Y-%m-%d")
         current_end_ts = int(datetime(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59).timestamp() * 1000)
 
@@ -319,7 +333,11 @@ class XueqiuProvider(BaseProvider):
                     column = data.get("column", [])
                     items = data.get("item", [])
                     if not items:
-                        logger.info(f"Xueqiu KLine returned empty items for {upper_symbol} at {current_end_ts}")
+                        # 空结果会被缓存管理器记为「该区间已覆盖」，符号写错或上游异常会因此静默固化，故用 WARNING
+                        logger.warning(
+                            f"Xueqiu KLine returned empty items for {upper_symbol} at {current_end_ts} "
+                            f"(slice {slice_start}~{slice_end}); 该区间将被标记为已覆盖，请确认符号有效"
+                        )
                         break
 
                     parsed_page = self._parse_kline_items(column, items)
@@ -336,24 +354,39 @@ class XueqiuProvider(BaseProvider):
                     ts_idx = column.index("timestamp")
                     earliest_ts = items[0][ts_idx]
 
-                    is_last = (len(items) < page_count) or (earliest_date <= slice_start)
+                    # 本切片是否已取全，三条依据任一成立：
+                    #   1) 未满页 —— 已触及上市首日/历史起点底线；
+                    #   2) 最早日期 <= slice_start —— 目标区间已全覆盖；
+                    #   3) page_count == est —— 估算未被上限截断，装满一页即等于取完整个窗口。
+                    # 依据 3 不可省：窗口起始日落在周末/节假日时，最早 K 线日期必然晚于 slice_start，依据 2 命不中。
+                    is_last = (
+                        len(items) < page_count
+                        or earliest_date <= slice_start
+                        or page_count == est
+                    )
 
                     # 即时流式落盘：若提供了 on_chunk 回调，立即写入 Parquet 并合并区间元数据
                     if on_chunk and new_page_records:
                         sorted_chunk = sorted(new_page_records, key=lambda x: x["date"])
                         cov_s = slice_start if is_last else sorted_chunk[0]["date"]
                         cov_e = current_page_end
+                        # 盘中半日 K 线不固化：区间一旦覆盖到今天，覆盖声明只到昨天——
+                        # 否则今天那根会被永久冻结成"已就绪"，收盘后不再刷新（T 日未发布保护由此触发）。
+                        today_str = date.today().strftime("%Y-%m-%d")
+                        if cov_e >= today_str:
+                            cov_e = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+                            if cov_s > cov_e:
+                                # 切片仅含今天一天：无跨度可声明，退化为只声明昨天（已被前序切片覆盖）
+                                cov_s = cov_e
                         if cov_s <= cov_e:
                             await on_chunk(sorted_chunk, cov_s, cov_e)
 
-                    # 严格终止判定 1：未满页（< 5000 根），已触及上市首日/历史起点底线
-                    if len(items) < page_count:
-                        logger.info(f"Xueqiu KLine reached historical origin for {upper_symbol}: {len(items)} < {page_count}")
-                        break
-
-                    # 严格终止判定 2：最早日期已早于或等于需要的 slice_start，目标区间已全覆盖
-                    if earliest_date <= slice_start:
-                        logger.info(f"Xueqiu KLine reached start date {slice_start} (earliest: {earliest_date})")
+                    # 终止判定：三条依据见上方 is_last
+                    if is_last:
+                        logger.info(
+                            f"Xueqiu KLine slice covered for {upper_symbol}: {len(all_records)} bars, "
+                            f"earliest {earliest_date} (slice_start {slice_start}, page_count {page_count}, est {est})"
+                        )
                         break
 
                     # 避免时间戳不推进造成死循环
@@ -445,7 +478,9 @@ class XueqiuProvider(BaseProvider):
             end_date=effective_end,
             fetch_fn=fetch_fn,
             date_column="date",
-            dimensions=dimensions
+            dimensions=dimensions,
+            # 缺口合并：跨度装得下一页就只发一次上游请求（请求次数是风控敏感资源）
+            coalesce=lambda s, e: estimate_bar_count(s, e, period_str) <= MAX_PAGE_SIZE,
         )
 
         return {

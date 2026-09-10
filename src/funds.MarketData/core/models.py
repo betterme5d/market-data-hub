@@ -138,3 +138,41 @@ class FundShareResponse(BaseModel):
     exchange: str = "szse"  # 交易所标识 (szse | sse)
     count: int  # 本批条数
     items: List[FundShare] = []
+
+
+class KLineBar(BaseModel):
+    """标准单根 K 线条目，对齐雪球 column 字段名称，供所有数据源统一使用。"""
+
+    date: str                              # 交易日期 YYYY-MM-DD
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float                          # 成交量（手/份）
+    amount: float                          # 成交额（元）
+    change: Optional[float] = None         # 涨跌额
+    percent: Optional[float] = None        # 涨跌幅（%）
+    turnover_rate: Optional[float] = None  # 换手率（%）
+
+    @field_validator("change", "percent", "turnover_rate", mode="before")
+    @classmethod
+    def sanitize_float(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, float) and math.isnan(v):
+            return None
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return None
+
+
+class KLineResponse(BaseModel):
+    """统一 K 线接口响应包装，对齐 FundShareResponse 格式。"""
+
+    code: str            # 归一化标准代码，如 002092.SZ
+    source: str          # 实际数据源，如 xueqiu / tencent / sina
+    period: str = "day"  # K 线周期：day | week | month
+    adjust: str = "qfq"  # 复权类型：qfq（前复权）| hfq（后复权）| none（不复权）
+    count: int           # 本批条数
+    items: List[KLineBar] = []

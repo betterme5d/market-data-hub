@@ -8,7 +8,8 @@
 main.py              应用装配：日志、FastAPI 创建、路由挂载、探针注册、lifespan
 core/                横切能力（无业务）：config / cache / health / dispatcher /
                      routing / filters / exceptions / models / calendar /
-                     timeseries_cache（通用时序 Parquet 增量缓存引擎）
+                     bar_estimator（K线根数估算）/ timeseries_cache（通用时序
+                     Parquet 增量缓存引擎）
 providers/           数据源实现（业务所在），按域分目录：
                      exchanges/ 交易所 · funds/ 基金 · quotes/ 行情 · misc/ 杂项
 routers/             HTTP 薄层：只做参数解析与异常包装，业务一律下沉到 provider
@@ -86,6 +87,8 @@ scripts/ tests/       工具与测试
    参数过滤列，自行改写就会静默踩坑）。迁移 = 忠实对齐，不是重写。
 5. **分页上限以上游实测为准并注释记录**。各接口真实分页上限不同且常与文档不符
    （lsjz=20、Fund_JJJZ_Data=20000、CMTIDP=5000），凭文档假设会翻页失败。
+   雪球 kline 实测单次可返 8441 根（SZ000001 全量历史，count=-20000 亦然），并**无 5000 硬上限**；
+   `core/bar_estimator.py` 的 `MAX_PAGE_SIZE=5000` 是风控保守值而非上游限制，勿据此推断上游能力。
 6. **外部输入先 strip 再匹配**。query 参数带尾随空格（`"cmtidp "`）曾直接 404 类报错；
    source、code 等入参须 `strip()` + 规范大小写后再查表。
 7. **探针禁止复制实现**。Probe 必须复用 Source 的取数/解析代码路径（见核心原则），
@@ -99,5 +102,5 @@ scripts/ tests/       工具与测试
 
 - **`IntervalTracker`**：纯闭区间拓扑差集计算与合并算法（求交、剪裁、合并）。
 - **`ParquetStorageEngine`**：基于 Apache Parquet 的列式存储，支持 Hive 风格多维目录隔离（`namespace/dim1=v1/.../key.parquet`）与原子 `.tmp` + `os.replace` 覆写。
-- **`TimeSeriesCacheManager`**：时序增量调度门面，提供标的级 `asyncio.Lock` 防并发穿透、T日未发布保护、以及逐页流式 `on_chunk` 写入。
+- **`TimeSeriesCacheManager`**：时序增量调度门面，提供标的级 `asyncio.Lock` 防并发穿透、T日未发布保护、以及逐页流式 `on_chunk` 写入。可选入参 `coalesce` 为缺失切片的合并策略回调：提供时把相邻缺口贪心装箱成尽量少的请求跨度（每段须仍能一次取完），以压低上游请求次数——**请求次数是风控敏感资源，重复拉取中间已覆盖区间的代价只是少量字节**（落盘按日期去重，不会产生重复行）。K 线路径注入的判据是「跨度工作日上界 ≤ `MAX_PAGE_SIZE`」；不传则保持逐缺口拉取。
 - **`PaginatedSliceCrawler`**：通用时序分页抓取器，统一封装自动翻页循环、页面间防反爬随机抖动休眠、单页异常指数退避重试、正序/倒序覆盖区间推导与逐页流式落盘回调。
