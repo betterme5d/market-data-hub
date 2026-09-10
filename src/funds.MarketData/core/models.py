@@ -173,6 +173,6 @@ class KLineResponse(BaseModel):
     code: str            # 归一化标准代码，如 002092.SZ
     source: str          # 实际数据源，如 xueqiu / tencent / sina
     period: str = "day"  # K 线周期：day | week | month
-    adjust: str = "qfq"  # 复权类型：qfq（前复权）| hfq（后复权）| none（不复权）
+    adjust: str = "none"  # 复权类型：none（不复权，缓存安全默认）| hfq（后复权）| qfq（前复权，值随最新价重算）
     count: int           # 本批条数
     items: List[KLineBar] = []

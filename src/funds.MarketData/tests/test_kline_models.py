@@ -34,7 +34,8 @@ def test_kline_bar_sanitize_nan():
 def test_kline_response_defaults():
     resp = KLineResponse(code="002092.SZ", source="xueqiu", count=0)
     assert resp.period == "day"
-    assert resp.adjust == "qfq"
+    # 不复权为缓存安全默认：qfq 值随最新价重算，与增量缓存相冲，不设为默认
+    assert resp.adjust == "none"
     assert resp.items == []
 
 

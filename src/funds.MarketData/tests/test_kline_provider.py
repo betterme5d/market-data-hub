@@ -58,6 +58,15 @@ async def test_get_kline_returns_kline_response(tmp):
 
 
 @pytest.mark.asyncio
+async def test_default_adjust_is_none_not_qfq(tmp):
+    """默认复权必须是不复权：qfq 值随最新价重算，与增量缓存相冲"""
+    p = KLineProvider(base_dir=tmp)
+    with patch.object(p, "_fetch_from_source", AsyncMock(return_value=BARS_QFQ)):
+        resp = await p.get_kline("002092.SZ", "2026-01-01", "2026-01-31", source="xueqiu")
+    assert resp.adjust == "none"
+
+
+@pytest.mark.asyncio
 async def test_cache_hit_skips_upstream(tmp):
     """缓存命中时，_fetch_from_source 第二次不应被调用"""
     p = KLineProvider(base_dir=tmp)

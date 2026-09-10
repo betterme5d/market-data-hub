@@ -57,7 +57,7 @@ class KLineProvider:
         end_date: str,
         *,
         source: Optional[str] = None,
-        adjust: str = "qfq",
+        adjust: str = "none",
         period: str = "day",
     ) -> KLineResponse:
         """
@@ -69,7 +69,10 @@ class KLineProvider:
             start_date: 起始日期 YYYY-MM-DD（必填）
             end_date:   结束日期 YYYY-MM-DD（必填）
             source:     数据源，默认 xueqiu；支持 xueqiu / tencent / sina
-            adjust:     复权类型：qfq（前复权）/ hfq（后复权）/ none（不复权）
+            adjust:     复权类型：none（默认，不复权）/ hfq（后复权）/ qfq（前复权）。
+                        **默认 none 而非 qfq**：前复权值随最新价重算，跨除权日把不同时间抓的
+                        窗口拼在一起会出现台阶，与增量缓存天然相冲，故不设为默认；
+                        确需 qfq 时请显式传入并自行承担口径漂移风险。
             period:     K 线周期：day / week / month
 
         Raises:

@@ -29,7 +29,7 @@ async def get_security_kline(
     start_date: str = Query(..., description="起始日期 YYYY-MM-DD（必填）"),
     end_date: str = Query(..., description="结束日期 YYYY-MM-DD（必填）"),
     source: Optional[str] = Query(None, description="数据源：xueqiu（已实现）；tencent / sina 为预留未实现（返回 501）"),
-    adjust: str = Query("qfq", description="复权：qfq (前复权) | hfq (后复权) | none (不复权)"),
+    adjust: str = Query("none", description="复权：none (不复权，默认) | hfq (后复权) | qfq (前复权；值随最新价重算，与增量缓存相冲，需显式指定)"),
     period: str = Query("day", description="周期：day (日K) | week (周K) | month (月K)"),
 ):
     """
