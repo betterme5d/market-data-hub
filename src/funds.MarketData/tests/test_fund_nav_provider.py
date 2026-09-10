@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import shutil
+import tempfile
 from unittest.mock import AsyncMock, patch
 import pytest
 
@@ -8,7 +9,9 @@ from core.models import FundNav
 from core.timeseries_cache.manager import TimeSeriesCacheManager
 from providers.funds.fund_nav import FundNavProvider
 
-TEST_CACHE_DIR = "data/test_fund_nav_provider_cache"
+# 测试产物落在系统临时目录：仓库目录被 dev 容器挂载并 watch，
+# 在源码树内反复建/删目录会让 uvicorn 的 StatReload 看门狗 rglob 撞上已消失的目录而崩溃
+TEST_CACHE_DIR = os.path.join(tempfile.gettempdir(), f"funds_nav_provider_test_{os.getpid()}")
 
 
 @pytest.fixture(autouse=True)

@@ -2,6 +2,7 @@
 import asyncio
 import os
 import shutil
+import tempfile
 from datetime import date, timedelta
 from unittest.mock import AsyncMock
 import pytest
@@ -10,7 +11,9 @@ from core.timeseries_cache.manager import TimeSeriesCacheManager
 from core.timeseries_cache.storage import ParquetStorageEngine
 from core.timeseries_cache.tracker import IntervalTracker
 
-TEST_CACHE_DIR = "data/test_manager_cache"
+# 测试产物落在系统临时目录：仓库目录被 dev 容器挂载并 watch，
+# 在源码树内反复建/删目录会让 uvicorn 的 StatReload 看门狗 rglob 撞上已消失的目录而崩溃
+TEST_CACHE_DIR = os.path.join(tempfile.gettempdir(), f"funds_cache_mgr_test_{os.getpid()}")
 
 
 @pytest.fixture(autouse=True)

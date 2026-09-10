@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 import os
 import shutil
+import tempfile
 import pytest
 from core.timeseries_cache.storage import ParquetStorageEngine
 
-TEST_CACHE_DIR = "data/test_cache"
+# 测试产物落在系统临时目录：仓库目录被 dev 容器挂载并 watch，
+# 在源码树内反复建/删目录会让 uvicorn 的 StatReload 看门狗 rglob 撞上已消失的目录而崩溃
+TEST_CACHE_DIR = os.path.join(tempfile.gettempdir(), f"funds_parquet_store_test_{os.getpid()}")
 
 
 @pytest.fixture(autouse=True)
@@ -19,8 +22,9 @@ def clean_test_cache():
 def test_partition_path():
     engine = ParquetStorageEngine(base_dir=TEST_CACHE_DIR)
     p_path, m_path = engine.get_paths("fund_nav", "510300", {"source": "eastmoney"})
-    assert "data/test_cache/fund_nav/source=eastmoney/510300.parquet" in p_path.replace("\\", "/")
-    assert "data/test_cache/fund_nav/source=eastmoney/510300.meta.json" in m_path.replace("\\", "/")
+    expected_dir = TEST_CACHE_DIR.replace("\\", "/")
+    assert f"{expected_dir}/fund_nav/source=eastmoney/510300.parquet" in p_path.replace("\\", "/")
+    assert f"{expected_dir}/fund_nav/source=eastmoney/510300.meta.json" in m_path.replace("\\", "/")
 
     # 多维正交排序一致性
     p_path2, _ = engine.get_paths("quotes_kline", "000001.SZ", {"source": "tencent", "adj": "hfq", "interval": "1d"})
