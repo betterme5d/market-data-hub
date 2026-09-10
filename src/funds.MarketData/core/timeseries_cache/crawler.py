@@ -87,6 +87,8 @@ class PaginatedSliceCrawler:
         page_index = start_page
         seen = 0
         total: Optional[int] = None
+        # 页数兜底：上游一直返回非空短页（限流抖动）时不能无限翻页
+        max_pages = 2000
 
         while True:
             # 翻页抖动延时（从第二页开始触发）
@@ -122,7 +124,24 @@ class PaginatedSliceCrawler:
             items.extend(page_items)
             seen += len(page_items)
 
-            is_last = (not page_items) or (total is not None and seen >= total) or (len(page_items) < page_size)
+            # 末页判定：
+            # - 上游给了总数（>0）就以总数为准——中途的短页可能是限流/抖动，若按"短页即末页"提前收尾，
+            #   末页规则会把覆盖区间一路标到请求起点，缺口就被永久标成"已覆盖"；
+            # - 总数缺失（东财返回 0 或缺键）才退回"短页即末页"的启发式；
+            # - 页数不超过总数推导值 +5（应对偶发短页）且不超过 max_pages。
+            page_cap = max_pages
+            if total is not None and total > 0:
+                page_cap = min(max_pages, (total + page_size - 1) // page_size + 5)
+                is_last = seen >= total
+            else:
+                is_last = (not page_items) or (len(page_items) < page_size)
+            if not page_items:
+                is_last = True
+            if page_index - start_page + 1 >= page_cap:
+                logger.warning(
+                    f"crawl_slice reached page cap {page_cap} (total={total}, seen={seen}); stopping pagination"
+                )
+                is_last = True
 
             # 只要本页请求成功，立即推导覆盖区间并执行 on_page 回调
             if on_page is not None:

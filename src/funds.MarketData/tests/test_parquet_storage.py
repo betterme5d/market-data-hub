@@ -92,3 +92,39 @@ def test_metadata_read_and_write():
     assert loaded is not None
     assert loaded["intervals"] == [["2024-01-01", "2024-05-31"]]
     assert loaded["row_count"] == 100
+
+
+def test_concurrent_writes_to_same_key_do_not_lose_rows():
+    """同一 key 的并发写不能丢行。
+
+    write_records 是"读全文件 → 拼接 → 原子覆写"；基金份额的全市场扇出用线程池并发写，
+    且多个重叠扇出批次会写同一批文件。没有按 key 的写锁时，先读到的写入者会覆盖掉后写入者
+    刚落的行（实测两个线程各写 100 天，3 轮里 2 轮只剩 100 天）。
+    """
+    import threading
+
+    engine = ParquetStorageEngine(base_dir=TEST_CACHE_DIR)
+    even_days = [{"date": f"2024-01-{d:02d}", "v": "even"} for d in range(1, 29, 2)]
+    odd_days = [{"date": f"2024-01-{d:02d}", "v": "odd"} for d in range(2, 29, 2)]
+    expected = {r["date"] for r in even_days} | {r["date"] for r in odd_days}
+    assert len(expected) == 28
+
+    for round_no in range(6):
+        barrier = threading.Barrier(2)
+
+        def writer(records):
+            barrier.wait()
+            for _ in range(5):
+                engine.write_records("fund_nav", "concurrent_key", records, date_column="date")
+
+        threads = [
+            threading.Thread(target=writer, args=(even_days,)),
+            threading.Thread(target=writer, args=(odd_days,)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        got = {r["date"] for r in engine.read_records("fund_nav", "concurrent_key", date_column="date")}
+        assert got == expected, f"第 {round_no + 1} 轮并发写丢行: 缺 {sorted(expected - got)}"

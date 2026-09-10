@@ -185,3 +185,43 @@ async def test_crawler_empty_page_covers_interval():
     assert callback_calls[0][0] == []
     assert callback_calls[0][1] == "2024-10-01"
     assert callback_calls[0][2] == "2024-10-07"
+
+
+@pytest.mark.asyncio
+async def test_crawler_short_middle_page_does_not_end_pagination():
+    """中途短页不能当末页：末页会把覆盖区间拉到请求起点，缺口会被永久标成已覆盖。
+
+    上游给了 TotalCount（=43）时，第 2 页只回了 3 条也必须继续翻到取满。
+    """
+    from core.timeseries_cache.crawler import PageBatch
+
+    pages = {
+        1: [f"2024-01-{d:02d}" for d in range(1, 21)],          # 满页 20
+        2: [f"2024-01-{d:02d}" for d in range(21, 24)],          # 短页 3（抖动）
+        3: [f"2024-01-{d:02d}" for d in range(24, 43)],          # 剩余 19
+    }
+    calls = []
+
+    async def fetch_page(page_index, page_size, s, e):
+        calls.append(page_index)
+        return PageBatch(items=pages.get(page_index, []), total_count=42)
+
+    crawler = PaginatedSliceCrawler(min_delay=0, max_delay=0)
+    covered = []
+
+    async def _on_page(recs, cs, ce):
+        covered.append((cs, ce, len(recs)))
+
+    items = await crawler.crawl_slice(
+        "2024-01-01", "2024-01-31",
+        page_size=20,
+        fetch_page_fn=fetch_page,
+        date_getter=lambda x: x,
+        order="desc",
+        on_page=_on_page,
+    )
+
+    assert calls == [1, 2, 3]
+    assert len(items) == 42
+    # 最后一页是第 3 页（19 < 20）且已取满 total，覆盖区间按末页规则延到请求起点
+    assert covered[-1][0] == "2024-01-01"
