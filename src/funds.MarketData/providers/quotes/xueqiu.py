@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
+from core import cache as cache_store
 from core import config
 from core.bar_estimator import MAX_PAGE_SIZE, estimate_bar_count
 from core.exceptions import BusinessException
@@ -124,6 +125,15 @@ class XueqiuProvider(BaseProvider):
         if self._cookie and time.time() < self._cookie_expiry:
             return self._cookie, self._user_agent
 
+        # 0. 共享缓存（Valkey）：跨实例/跨进程复用，避免每次缓存未命中都经网关重取 Cookie
+        shared = cache_store.get_xueqiu_auth()
+        if shared:
+            self._cookie = shared["cookie"]
+            self._user_agent = shared.get("userAgent") or self.default_ua
+            self._cookie_expiry = time.time() + 600
+            logger.debug("Reused Xueqiu Cookie from shared cache.")
+            return self._cookie, self._user_agent
+
         # 1. 尝试从本地 Playwright 鉴权网关获取
         try:
             async with httpx.AsyncClient(timeout=15, verify=False) as client:
@@ -133,7 +143,8 @@ class XueqiuProvider(BaseProvider):
                     if res_json.get("success"):
                         self._cookie = res_json.get("cookie")
                         self._user_agent = res_json.get("userAgent", self.default_ua)
-                        self._cookie_expiry = time.time() + 600  # 10 分钟缓存
+                        self._cookie_expiry = time.time() + 600  # 10 分钟进程内缓存
+                        cache_store.set_xueqiu_auth(self._cookie, self._user_agent)
                         logger.info("Successfully fetched Xueqiu Cookie from auth service gateway.")
                         return self._cookie, self._user_agent
         except Exception as e:
@@ -147,11 +158,12 @@ class XueqiuProvider(BaseProvider):
                 cookies_list = []
                 for name, value in resp.cookies.items():
                     cookies_list.append(f"{name}={value}")
-                
+
                 if cookies_list:
                     self._cookie = "; ".join(cookies_list)
                     self._user_agent = self.default_ua
                     self._cookie_expiry = time.time() + 600
+                    cache_store.set_xueqiu_auth(self._cookie, self._user_agent)
                     logger.info("Successfully fetched Xueqiu Cookie directly from xueqiu.com")
                     return self._cookie, self._user_agent
         except Exception as ex:
@@ -191,6 +203,7 @@ class XueqiuProvider(BaseProvider):
                 if resp.status_code in [400, 403]:
                     logger.warning(f"Xueqiu returned {resp.status_code}, clearing cookie and retrying...")
                     self._cookie = None
+                    cache_store.clear_xueqiu_auth()
                     cookie, ua = await self._ensure_cookie()
                     headers["Cookie"] = cookie
                     headers["User-Agent"] = ua
@@ -366,6 +379,7 @@ class XueqiuProvider(BaseProvider):
                     if resp.status_code in [400, 403]:
                         logger.warning("Xueqiu KLine cookie expired, clearing and retrying...")
                         self._cookie = None
+                        cache_store.clear_xueqiu_auth()
                         cookie, ua = await self._ensure_cookie()
                         headers["Cookie"] = cookie
                         headers["User-Agent"] = ua
