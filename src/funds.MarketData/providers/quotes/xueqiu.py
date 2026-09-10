@@ -13,7 +13,7 @@ from core.exceptions import BusinessException
 from core.models import UnifiedQuote
 from core.routing import translate_standard_symbol
 from core.timeseries_cache.manager import TimeSeriesCacheManager
-from providers.base import BaseProvider
+from providers.base import BaseProvider, SourceProbe
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,56 @@ def normalize_xueqiu_symbol(symbol: str) -> str:
             # 前缀分支会先吞掉 HKHSI.US 这类以 hk 开头的输入，故此处兜底再剥一次 .US
             return code
     return symbol.upper()
+
+
+class XueqiuKlineProbe(SourceProbe):
+    """雪球历史 K 线（v5/stock/chart/kline.json）接口探针。
+
+    实时行情走的是另一条上游接口（realtime/quotec.json），契约不同，接口变更互不牵连，
+    故按「1 个上游接口 = 1 个探针」各配一个。本探针复用 K 线取数/解析代码路径
+    （_fetch_kline_slice），仅把窗口收到最近几天以保持最轻量；不落任何缓存。
+    """
+
+    name = "xueqiu-kline"
+    category = "quotes"
+
+    # 上证指数：长期存在且每个交易日都有数据，作为可用性金丝雀最稳
+    PROBE_SYMBOL = "SH000001"
+    PROBE_DAYS = 10
+    # 最新 K 线距今超过该天数即视为停更（>春节/国庆长假窗口，正常不触发）
+    STALE_DAYS = 15
+
+    def __init__(self) -> None:
+        # 复用同一实例以保留 Cookie 内存缓存（10 分钟），避免每次探测都经网关重取
+        self._provider = XueqiuProvider()
+
+    async def probe(self) -> None:
+        """取最近一段日 K（单次上游请求），校验解析结构与数值合理性。"""
+        today = date.today()
+        records = await self._provider._fetch_kline_slice(
+            symbol=self.PROBE_SYMBOL,
+            slice_start=(today - timedelta(days=self.PROBE_DAYS)).strftime("%Y-%m-%d"),
+            slice_end=today.strftime("%Y-%m-%d"),
+            period_str="day",
+            adjust_type="normal",
+        )
+        if not records:
+            raise RuntimeError(f"{self.name}: {self.PROBE_SYMBOL} 上游返回 0 根 K 线")
+
+        latest = max(records, key=lambda r: r["date"])
+        missing = [f for f in ("date", "open", "high", "low", "close", "volume", "amount") if f not in latest]
+        if missing:
+            raise RuntimeError(f"{self.name}: 解析结果缺字段 {missing}")
+        if not latest["close"] or latest["close"] <= 0:
+            raise RuntimeError(f"{self.name}: 收盘价非法 {latest['close']!r}")
+        if latest["high"] < latest["low"]:
+            raise RuntimeError(f"{self.name}: 最高价低于最低价")
+
+        age_days = (today - datetime.strptime(latest["date"], "%Y-%m-%d").date()).days
+        if age_days > self.STALE_DAYS:
+            raise RuntimeError(
+                f"{self.name}: 最新 K 线为 {latest['date']}（距今 {age_days} 天），疑似接口停更"
+            )
 
 
 class XueqiuProvider(BaseProvider):
