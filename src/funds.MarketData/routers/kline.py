@@ -28,7 +28,7 @@ async def get_security_kline(
     code: str = Path(..., description="证券代码（任意格式：002092.SZ / SZ002092 / 510300.SH / AAPL.US）"),
     start_date: str = Query(..., description="起始日期 YYYY-MM-DD（必填）"),
     end_date: str = Query(..., description="结束日期 YYYY-MM-DD（必填）"),
-    source: Optional[str] = Query(None, description="数据源：xueqiu (默认) | tencent | sina"),
+    source: Optional[str] = Query(None, description="数据源：xueqiu（已实现）；tencent / sina 为预留未实现（返回 501）"),
     adjust: str = Query("qfq", description="复权：qfq (前复权) | hfq (后复权) | none (不复权)"),
     period: str = Query("day", description="周期：day (日K) | week (周K) | month (月K)"),
 ):
@@ -59,6 +59,9 @@ async def get_security_kline(
         raise HTTPException(status_code=400, detail=str(ve))
     except BusinessException as be:
         raise HTTPException(status_code=400, detail=str(be))
+    except NotImplementedError as nie:
+        # 预留数据源尚未实现：属于「已知不支持」，不是服务端故障，勿报 500 触发告警
+        raise HTTPException(status_code=501, detail=str(nie))
     except Exception as e:
         logger.error(f"Get kline failed for {code}: {e}")
         raise HTTPException(status_code=500, detail=str(e))

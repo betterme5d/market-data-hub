@@ -58,6 +58,17 @@ def test_invalid_source_returns_400(mock_p):
 
 
 @patch("routers.kline.kline_provider")
+def test_unimplemented_source_returns_501(mock_p):
+    """预留未实现的数据源（tencent/sina）应返回 501，而非 500 误报服务端故障"""
+    mock_p.get_kline = AsyncMock(side_effect=NotImplementedError("Source 'tencent' not yet implemented"))
+    r = client.get(
+        "/api/v1/securities/002092.SZ/kline?start_date=2026-01-01&end_date=2026-01-31&source=tencent"
+    )
+    assert r.status_code == 501
+    assert "not yet implemented" in r.json()["detail"]
+
+
+@patch("routers.kline.kline_provider")
 def test_xueqiu_raw_format_accepted(mock_p):
     """C# 侧可能传来 SZ002092 格式，必须被接受"""
     mock_p.get_kline = AsyncMock(return_value=SAMPLE)
