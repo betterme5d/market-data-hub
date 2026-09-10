@@ -2,7 +2,8 @@
 """
 K 线标准接口路由。
 提供 /api/v1/securities/{code}/kline RESTful 端点。
-旧接口 /history/{symbol} 保留在 routers/quotes.py 做桥接，不在此文件重复定义。
+历史 K 线的统一入口；/history/{symbol} 是另一套独立旧实现（多数据源路由，C# YahooFinanceStockService 在用），
+裸转发端点 /xueqiu/kline 已随 C# 备用通道删除。
 """
 import logging
 from typing import Optional

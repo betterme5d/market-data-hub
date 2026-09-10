@@ -41,7 +41,6 @@ from routers import (
     premium,
     quotes,
     sws,
-    xueqiu_gw,
 )
 
 LOG_LEVEL = logging.DEBUG if config.DEBUG else logging.INFO
@@ -160,7 +159,6 @@ app.include_router(premium.router)
 app.include_router(akshare.router)
 app.include_router(sws.router)
 app.include_router(calendar.router)
-app.include_router(xueqiu_gw.router)
 app.include_router(kline.router)
 
 
