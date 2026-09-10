@@ -4,7 +4,7 @@
 """
 import asyncio
 import concurrent.futures
-from datetime import datetime
+from datetime import date, datetime, timedelta
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from core.models import FundShare
 from core.timeseries_cache.storage import ParquetStorageEngine
 from core.timeseries_cache.tracker import IntervalTracker
-from providers.exchanges.shares.sse import SseShareSource
+from providers.exchanges.shares.sse import SSE_ETF_EARLIEST_DATE, SseShareSource
 from providers.exchanges.shares.szse import SzseShareSource, split_date_range
 
 logger = logging.getLogger(__name__)
@@ -77,6 +77,18 @@ class FundShareProvider:
         # 1. 检测目标基金当前缓存覆盖
         meta = self.storage.read_metadata(namespace, clean_code, dimensions=dims) or {}
         intervals = meta.get("intervals", [])
+
+        # 1.5 沪市 2012-01-04 之前上游不存在任何基金份额数据（源侧常量有实测依据）：这段直接按"已覆盖"
+        # 记入目标基金。否则那段窗口拉回来是空的，会被空市场防线拒绝标记，每次补录都要重走一遍这段日历。
+        if resolved_exchange == "sse" and start_date < SSE_ETF_EARLIEST_DATE:
+            pre_boundary_end = (
+                date.fromisoformat(SSE_ETF_EARLIEST_DATE) - timedelta(days=1)
+            ).isoformat()
+            if self.tracker.find_missing_slices(intervals, start_date, pre_boundary_end):
+                self._update_fund_interval(clean_code, start_date, pre_boundary_end, dims, namespace)
+                meta = self.storage.read_metadata(namespace, clean_code, dimensions=dims) or {}
+                intervals = meta.get("intervals", [])
+
         missing_slices = self.tracker.find_missing_slices(intervals, start_date, end_date)
 
         # 2. 若存在缺失切片，在交易所锁保护下拉取并全市场扇出落盘
@@ -100,10 +112,25 @@ class FundShareProvider:
                             logger.info(
                                 f"Fetching SSE market fund shares for [{s_slice} ~ {e_slice}] (triggered by {clean_code})"
                             )
-                            market_data = await self.sse_source.fetch_market_shares_range(s_slice, e_slice)
-                            await self._dispatch_fanout(
-                                market_data, clean_code, s_slice, e_slice, dims, namespace
+                            # 沪市是逐交易日拉全市场（每交易日 2.5~4 秒），必须边拉边落盘：
+                            # 否则一次客户端断开（C# 侧超时）就让整段的逐日工作全部作废。
+                            # 覆盖区间也只按"实际完整拉到的窗口"标记（窗口日历连续，会合并成一整段）——
+                            # 不能再按整段补记，否则某个分类接口挂掉那天会被标成已覆盖、那天永久缺失。
+                            flushed = False
+
+                            def _on_window(window, w_start, w_end):
+                                nonlocal flushed
+                                flushed = True
+                                self._dispatch_fanout_sync(window, clean_code, w_start, w_end, dims, namespace)
+
+                            market_data = await self.sse_source.fetch_market_shares_range(
+                                s_slice, e_slice, on_window=_on_window
                             )
+                            if not flushed and market_data:
+                                # 回调一次都没触发（旧实现/测试桩）：退回"整段一次"落盘与标记
+                                self._dispatch_fanout_sync(
+                                    market_data, clean_code, s_slice, e_slice, dims, namespace
+                                )
                     else:
                         # 深交所：按 <=60 天分片拉取
                         chunks = split_date_range(s_slice, e_slice, max_days=60)
@@ -151,11 +178,26 @@ class FundShareProvider:
         dims: Dict[str, str],
         namespace: str,
     ) -> None:
+        """异步入口，语义同 _dispatch_fanout_sync。"""
+        self._dispatch_fanout_sync(market_data, target_code, chunk_s, chunk_e, dims, namespace)
+
+    def _dispatch_fanout_sync(
+        self,
+        market_data: Dict[str, List[Dict[str, Any]]],
+        target_code: str,
+        chunk_s: str,
+        chunk_e: str,
+        dims: Dict[str, str],
+        namespace: str,
+    ) -> None:
         """
         分发扇出落盘：
         1. 目标基金（target_code）优先在主线程极速持久化并更新元数据（~5ms），确保立刻对当前请求可用；
         2. 剩余基金：若是小规模（<=10只，如测试），直接线程池同步完成；
            若是真实全市场（几百只），放入后台异步任务（线程池并发），彻底不阻塞主事件循环与当前响应。
+
+        本方法为**同步**实现：除 create_task 外不 await，因此也能在"请求已被取消"的
+        回调路径（沪市逐交易日增量落盘）里安全调用——那种场景下任何 await 都会立刻再抛 CancelledError。
         """
         # 0. 空市场防线（Empty Market Guard）：
         # 若上游接口异常或格式解析失败导致全市场数据为空，严禁写入覆盖区间，彻底杜绝缓存毒化

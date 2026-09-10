@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from unittest.mock import AsyncMock, patch
 from providers.exchanges.shares.sse import SseShareSource
@@ -78,13 +80,65 @@ async def test_sse_fetch_range_delay_control():
     async def mock_sleep(sec):
         sleep_calls.append(sec)
 
-    with patch.object(source, "fetch_daily_market_shares", return_value={"510050": {"code": "510050", "share_date": "d", "shares": 1.0}}), \
+    with patch.object(source, "fetch_daily_market_shares_checked", return_value=({"510050": {"code": "510050", "share_date": "d", "shares": 1.0}}, True)), \
          patch("asyncio.sleep", side_effect=mock_sleep):
         # 2026-06-25 与 2026-06-26 均为周四、周五交易日
         await source.fetch_market_shares_range("2026-06-25", "2026-06-26")
 
         assert len(sleep_calls) == 1
         assert 0.5 <= sleep_calls[0] <= 3.0
+
+
+@pytest.mark.asyncio
+async def test_sse_fetch_range_flushes_incrementally():
+    """每积累 flush_every_days 个交易日落盘一次，收尾再落一次未满窗口的尾巴。"""
+    source = SseShareSource(delay_ms=0)
+    flush_calls = []
+
+    async def mock_checked(day):
+        return {"510050": {"code": "510050", "share_date": day, "shares": 1.0}}, True
+
+    def on_window(records, w_start, w_end):
+        flush_calls.append((w_start, w_end, len(records.get("510050", []))))
+
+    with patch.object(source, "fetch_daily_market_shares_checked", side_effect=mock_checked):
+        # 2026-06-22(周一)~06-26(周五) 共 5 个交易日，flush_every_days=2 → 2+2+1
+        await source.fetch_market_shares_range(
+            "2026-06-22", "2026-06-26", on_window=on_window, flush_every_days=2
+        )
+
+    assert flush_calls == [
+        ("2026-06-22", "2026-06-23", 2),
+        ("2026-06-24", "2026-06-25", 2),
+        ("2026-06-26", "2026-06-26", 1),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sse_fetch_range_flushes_partial_window_on_cancel():
+    """客户端断开（中间件 cancel）时，已拉到的交易日必须落盘，不能整段作废。"""
+    source = SseShareSource(delay_ms=0)
+    flush_calls = []
+    fetched = []
+
+    async def mock_checked(day):
+        if day == "2026-06-24":
+            raise asyncio.CancelledError()
+        fetched.append(day)
+        return {"510050": {"code": "510050", "share_date": day, "shares": 1.0}}, True
+
+    def on_window(records, w_start, w_end):
+        flush_calls.append((w_start, w_end, len(records.get("510050", []))))
+
+    with patch.object(source, "fetch_daily_market_shares_checked", side_effect=mock_checked):
+        with pytest.raises(asyncio.CancelledError):
+            await source.fetch_market_shares_range(
+                "2026-06-22", "2026-06-26", on_window=on_window, flush_every_days=10
+            )
+
+    # 22/23 已拉到但未满一个窗口，取消时收尾落盘；24 及之后未取到，不能被标记为已缓存
+    assert fetched == ["2026-06-22", "2026-06-23"]
+    assert flush_calls == [("2026-06-22", "2026-06-23", 2)]
 
 
 @pytest.mark.asyncio
@@ -169,3 +223,42 @@ async def test_sse_fetch_range_prior_to_2012_has_no_delay():
         assert len(sleep_calls) == 0
 
 
+
+
+@pytest.mark.asyncio
+async def test_sse_incomplete_day_stays_uncovered():
+    """某个分类接口挂掉的那一天：不落盘、不进入覆盖区间，留给下次补录重取。
+
+    否则整个窗口被标成已覆盖，而那天缺的那一类基金会永久缺失。
+    """
+    source = SseShareSource(delay_ms=0)
+    windows = []
+
+    async def mock_checked(day):
+        rec = {"510050": {"code": "510050", "share_date": day, "shares": 1.0}}
+        if day == "2026-06-24":
+            return rec, False   # 该日某个分类接口失败 → 不完整
+        return rec, True
+
+    with patch.object(source, "fetch_daily_market_shares_checked", side_effect=mock_checked):
+        records = await source.fetch_market_shares_range(
+            "2026-06-22", "2026-06-26",
+            on_window=lambda w, s, e: windows.append((s, e, len(w.get("510050", [])))),
+            flush_every_days=10,
+        )
+
+    # 22/23 一个窗口；24 不完整 → 窗口在 23 结束，25 处重开
+    assert windows == [("2026-06-22", "2026-06-23", 2), ("2026-06-25", "2026-06-26", 2)]
+    # 失败日已拿到的部分记录既不落盘也不返回，避免半天数据进缓存
+    assert sorted(r["share_date"] for r in records["510050"]) == [
+        "2026-06-22", "2026-06-23", "2026-06-25", "2026-06-26",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sse_pre_2012_days_are_complete():
+    """2012-01-04 之前源侧不发请求，但属于"完整"（可以标记覆盖），否则永远重复走这段日历。"""
+    source = SseShareSource(delay_ms=0)
+    records, complete = await source.fetch_daily_market_shares_checked("2005-03-01")
+    assert records == {}
+    assert complete is True

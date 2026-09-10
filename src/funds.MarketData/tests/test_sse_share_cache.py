@@ -41,3 +41,33 @@ async def test_fund_share_provider_sse_fanout(tmp_path: Path):
     # 3. 验证元数据覆盖区间
     meta = storage.read_metadata("fund_share", "510300", dimensions={"exchange": "sse"})
     assert [tuple(x) for x in meta["intervals"]] == [("2026-06-01", "2026-06-30")]
+
+
+@pytest.mark.asyncio
+async def test_provider_marks_pre_2012_sse_range_covered_without_fetching(tmp_path: Path):
+    """沪市 2012-01-04 之前上游没有份额数据：直接按已覆盖记入，不请求上游。"""
+    storage = ParquetStorageEngine(base_dir=tmp_path)
+    mock_sse = AsyncMock(spec=SseShareSource)
+    mock_sse.fetch_market_shares_range.return_value = {}
+    provider = FundShareProvider(storage=storage, tracker=IntervalTracker(), sse_source=mock_sse)
+
+    await provider.get_fund_shares("510050", "2005-02-22", "2005-09-29")
+
+    mock_sse.fetch_market_shares_range.assert_not_called()
+    meta = storage.read_metadata("fund_share", "510050", dimensions={"exchange": "sse"})
+    assert [tuple(x) for x in meta["intervals"]] == [("2005-02-22", "2012-01-03")]
+
+
+@pytest.mark.asyncio
+async def test_provider_only_fetches_after_2012_boundary(tmp_path: Path):
+    """跨 2012 边界：只把 2012-01-04 之后的部分发给上游。"""
+    storage = ParquetStorageEngine(base_dir=tmp_path)
+    mock_sse = AsyncMock(spec=SseShareSource)
+    mock_sse.fetch_market_shares_range.return_value = {}
+    provider = FundShareProvider(storage=storage, tracker=IntervalTracker(), sse_source=mock_sse)
+
+    await provider.get_fund_shares("510050", "2011-12-01", "2012-01-31")
+
+    args = mock_sse.fetch_market_shares_range.call_args.args
+    assert args[0] == "2012-01-04"
+    assert args[1] == "2012-01-31"
