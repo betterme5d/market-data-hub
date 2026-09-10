@@ -15,9 +15,11 @@ def resolve_symbol_identity(raw: str) -> str:
     """
     解析符号身份，供统一取数门面作为缓存键与响应标识：
 
-    - 能识别为系统标准码的（002092 / 510300.SH / SH510300 / AAPL.US / 00700.HK）→ 返回归一化标准码；
-    - 识别不了的按数据源原生符号原样返回（如 HKHSI / CSI930875 / .SPGSCL / HKDCNY.FX）——
-      这些没有系统后缀约定，格式转换由各数据源自身的转换逻辑负责，此处不做假设。
+    - 带后缀或纯数字的（002092 / 510300.SH / SH510300 / AAPL.US / 00700.HK）→ 返回归一化标准码，
+      其中裸 6 位数字必须展开（002092 → 002092.SZ），否则上游不认；
+    - 纯字母的（AAPL / USO / HKHSI）→ **保持原样**：裸字母本身就是各数据源通用的代码形态，
+      而标准归一化只能按「2-5 位字母 → 美股」推断，会把恒指 HKHSI 误判成 HKHSI.US；
+    - 其余识别不了的（CSI930875 / .SPGSCL / HKDCNY.FX）→ 原样返回，格式转换交由各数据源自身的转换逻辑。
 
     仅做基本形态校验，非法形态抛 ValueError。
     """
@@ -26,6 +28,8 @@ def resolve_symbol_identity(raw: str) -> str:
     s = raw.strip()
     if not _SYMBOL_PATTERN.match(s):
         raise ValueError(f"Invalid symbol: {raw!r}")
+    if s.isalpha():
+        return s.upper()
     norm = normalize_symbol(s)
     return norm[0] if norm else s.upper()
 

@@ -8,19 +8,22 @@ from providers.quotes.xueqiu import normalize_xueqiu_symbol
 
 
 @pytest.mark.parametrize("raw,expected", [
-    # 系统标准码 -> 归一化标准码（缓存身份统一）
+    # 带后缀或纯数字 -> 归一化标准码（裸 6 位必须展开，否则上游不认）
     ("002092", "002092.SZ"),
     ("510300.SH", "510300.SH"),
     ("SH510300", "510300.SH"),
     ("sz399807", "399807.SZ"),
     ("AAPL.US", "AAPL.US"),
     ("00700.HK", "00700.HK"),
-    # 数据源原生符号 -> 原样保留（无系统后缀约定，不做格式推导）
-    ("HKHSI", "HKHSI.US"),          # 5 位纯字母会被识别为美股形态，属既有推断
+    ("00700", "00700.HK"),
+    # 纯字母 -> 保持原样：裸字母是各源通用形态，而归一化只能按「2-5 位字母 → 美股」推断
+    ("AAPL", "AAPL"),
+    ("USO", "USO"),
+    ("HKHSI", "HKHSI"),        # 恒指：原样交给雪球，不被推断成 HKHSI.US
+    # 其余识别不了的 -> 原样返回，转换交给数据源自身逻辑
     ("CSI930875", "CSI930875"),
     (".SPGSCL", ".SPGSCL"),
     ("HKDCNY.FX", "HKDCNY.FX"),
-    ("USO", "USO.US"),
 ])
 def test_resolve_symbol_identity(raw, expected):
     assert resolve_symbol_identity(raw) == expected
