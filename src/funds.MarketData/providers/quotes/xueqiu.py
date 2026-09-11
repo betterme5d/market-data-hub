@@ -116,6 +116,13 @@ async def kline_guard():
         async with _KLINE_SEMAPHORE:
             yield
         ok = True
+    except BusinessException as be:
+        # D14：业务型异常（无数据 / 代码不存在 / 上游明确拒绝 / Cookie 未就绪）不算源故障——
+        # 源是可达的，与 QuoteDispatcher 的口径保持一致；只有系统级异常（网络/解析）才计失败，
+        # 否则一次无效代码就能把整个 xueqiu 源在健康面板上标记成不健康。
+        ok = True
+        logger.warning(f"Xueqiu kline business exception (source reachable): {be}")
+        raise
     finally:
         health.record_call(
             "xueqiu",

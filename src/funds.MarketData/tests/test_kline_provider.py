@@ -185,3 +185,56 @@ async def test_kline_fetch_records_health_sample(tmp_path):
     assert mock_record.call_count >= 1
     assert mock_record.call_args.args[0] == "xueqiu"
     assert mock_record.call_args.args[1] is True
+
+@pytest.mark.asyncio
+async def test_kline_guard_excludes_business_exception_from_failures(monkeypatch):
+    """D14：业务型异常（上游有应答但无数据/代码不存在/明确拒绝）不算源故障。
+
+    口径与 QuoteDispatcher 一致：源可达则记 ok=True；只有系统级异常（网络/解析）才计失败，
+    否则一次无效代码就能把整个 xueqiu 源标记成不健康。
+    """
+    from core import health as health_svc
+    from core.exceptions import BusinessException
+    from providers.quotes import xueqiu as xq_mod
+
+    calls = []
+    monkeypatch.setattr(
+        health_svc,
+        "record_call",
+        lambda source, ok, latency_ms, via="business", error=None: calls.append((source, ok, via)),
+    )
+
+    # 与本次修复无关：避免在无 Valkey/DNS 的环境里等连接超时（is_source_blocked 会连 valkey）
+    from core.dispatcher import QuoteDispatcher
+    monkeypatch.setattr(QuoteDispatcher, "is_source_blocked", staticmethod(lambda source: False))
+
+    with pytest.raises(BusinessException):
+        async with xq_mod.kline_guard():
+            raise BusinessException("Xueqiu API error: 该代码不存在")
+
+    assert calls == [("xueqiu", True, "business")]
+
+
+@pytest.mark.asyncio
+async def test_kline_guard_counts_system_exception_as_failure(monkeypatch):
+    """D14 反面：系统级异常仍必须计入失败（否则熔断/健康面板就失去意义）。"""
+    from core import health as health_svc
+    from providers.quotes import xueqiu as xq_mod
+
+    calls = []
+    monkeypatch.setattr(
+        health_svc,
+        "record_call",
+        lambda source, ok, latency_ms, via="business", error=None: calls.append((source, ok, via)),
+    )
+
+    # 与本次修复无关：避免在无 Valkey/DNS 的环境里等连接超时（is_source_blocked 会连 valkey）
+    from core.dispatcher import QuoteDispatcher
+    monkeypatch.setattr(QuoteDispatcher, "is_source_blocked", staticmethod(lambda source: False))
+
+    with pytest.raises(RuntimeError):
+        async with xq_mod.kline_guard():
+            raise RuntimeError("connection reset by peer")
+
+    assert calls == [("xueqiu", False, "business")]
+
