@@ -151,9 +151,10 @@ async def test_xueqiu_kline_parquet_cache_integration(temp_cache_dir, monkeypatc
     assert len(res1["data"]) == 2
 
     # 验证 Parquet 文件已生成
-    # 缓存维度已归一化（D26）：adj=normal/before/after、interval=day/week/month
+    # D12：缓存口径与 KLineProvider 完全一致——key 用标准码、维度 {source, adjust, period}，
+    # adjust 值用对外口径 none/qfq/hfq（上游原生 normal/before/after 只作请求参数）
     p_path, m_path = storage.get_paths(
-        "kline", "SH510050", dimensions={"adj": "normal", "interval": "day", "source": "xueqiu"}
+        "kline", "510050.SH", dimensions={"source": "xueqiu", "adjust": "none", "period": "day"}
     )
     assert os.path.exists(p_path)
     assert os.path.exists(m_path)
@@ -412,5 +413,8 @@ async def test_legacy_get_history_normalizes_cache_dimensions():
     )
 
     dims = cap.kwargs["dimensions"]
-    assert dims["adj"] in {"normal", "before", "after"}, dims
-    assert dims["interval"] in {"day", "week", "month"}, dims
+    # D12：维度键与值都统一到 KLineProvider 口径（键 adjust/period，值对外口径）
+    assert dims["adjust"] in {"none", "qfq", "hfq"}, dims
+    assert dims["period"] in {"day", "week", "month"}, dims
+    assert "adj" not in dims and "interval" not in dims, dims
+    assert cap.kwargs["key"] == "510300.SH", "缓存 key 必须是系统标准码"

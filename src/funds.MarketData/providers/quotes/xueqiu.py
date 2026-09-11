@@ -16,6 +16,7 @@ from core.bar_estimator import MAX_PAGE_SIZE, estimate_bar_count
 from core.exceptions import BusinessException
 from core.models import UnifiedQuote
 from core.routing import translate_standard_symbol
+from core.symbol_normalizer import resolve_symbol_identity
 from core.timeseries_cache.manager import TimeSeriesCacheManager
 from providers.base import BaseProvider, SourceProbe
 
@@ -42,6 +43,10 @@ def normalize_xueqiu_symbol(symbol: str) -> str:
             return code
     return symbol.upper()
 
+
+# 缓存维度值的对外口径（与 providers/quotes/kline_provider.ADJUST_MAP 的键一致）：
+# 上游雪球用原生 normal/before/after，缓存与对外 API 用 none/qfq/hfq。
+_CACHE_ADJUST = {"normal": "none", "before": "qfq", "after": "hfq"}
 
 class XueqiuKlineProbe(SourceProbe):
     """雪球历史 K 线（v5/stock/chart/kline.json）接口探针。
@@ -574,11 +579,19 @@ class XueqiuProvider(BaseProvider):
             effective_start = start
 
         upper_symbol = normalize_xueqiu_symbol(symbol)
+        # D12：缓存 key 与维度必须和 KLineProvider 完全一致——
+        #   key 用系统标准码（不是雪球代码 SZ002092），维度用 {source, adjust, period}。
+        # 否则同一份雪球 K 线会在两套目录树各存一份：互相看不到对方的缓存、重复回源。
+        # 注意：上游请求仍用雪球自己的代码格式（upper_symbol），只有缓存口径归一。
+        cache_key = resolve_symbol_identity(symbol)
+        # 维度值也必须与 KLineProvider 一致：它对外的 adjust 口径是 none/hfq/qfq（上游原生
+        # normal/before/after 只是请求参数）。两边若用不同值，同一份数据仍会落在两个目录里。
+        cache_adjust = _CACHE_ADJUST[adjust_type]
         dimensions = {
             "source": "xueqiu",
-            # adj / interval 来自查询参数：必须用归一化后的值，原样拼路径会造成缓存目录穿越
-            "adj": adjust_type,
-            "interval": period_str,
+            # 值都取自归一化结果（none/hfq/qfq、day/week/month）：原样拼路径会造成缓存目录穿越
+            "adjust": cache_adjust,
+            "period": period_str,
         }
 
         async def fetch_fn(s_slice: str, e_slice: str, on_chunk=None):
@@ -594,7 +607,7 @@ class XueqiuProvider(BaseProvider):
 
         records = await self.cache_manager.get_or_fetch(
             namespace="kline",
-            key=upper_symbol,
+            key=cache_key,
             start_date=effective_start,
             end_date=effective_end,
             fetch_fn=fetch_fn,
