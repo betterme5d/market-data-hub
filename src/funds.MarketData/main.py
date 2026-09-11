@@ -28,6 +28,7 @@ from providers.funds.cmtidp import CmtidpProbe
 from providers.funds.eastmoney import EastmoneyProbe
 from providers.funds.establish_dates import EastmoneyEstablishDateProbe
 from providers.funds.fund_profile import EastmoneyProfileProbe
+from providers.funds.shares.provider import fund_share_provider
 from providers.exchanges.shares.sse import SseShareProbe
 from providers.exchanges.shares.szse import SzseShareProbe
 from providers.misc.cfets import CfetsProbe
@@ -111,6 +112,20 @@ def _register_probes() -> None:
         health_svc.register_probe(provider.name, provider.category, provider.probe)
 
 
+async def _drain_share_fanouts(timeout: float = 30.0) -> None:
+    """优雅退出：等待后台份额扇出落盘完成。
+
+    份额是全市场扇出，落盘在后台线程池里进行；进程直接退出会让最后一批已拉取的数据丢掉。
+    超时只告警不阻塞退出（已落盘的部分不受影响）。
+    """
+    try:
+        await asyncio.wait_for(fund_share_provider.wait_pending_fanouts(), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"等待后台份额扇出落盘超时（{timeout:.0f}s），仍有任务未完成；已落盘部分不受影响"
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _register_probes()
@@ -121,6 +136,7 @@ async def lifespan(app: FastAPI):
     finally:
         stop_event.set()
         await probe_task
+        await _drain_share_fanouts()
 
 
 app = FastAPI(
