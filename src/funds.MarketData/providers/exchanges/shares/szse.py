@@ -3,6 +3,7 @@
 深交所（SZSE）公募基金历史份额数据源与健康探针。
 支持 <=60 天安全切片防 65,536 行截断、流式解析 XLSX、万份换算与全市场代码分组。
 """
+import asyncio
 import collections
 from datetime import date, datetime, timedelta
 import io
@@ -25,6 +26,9 @@ _UA = (
 
 SZSE_SHARE_REPORT_URL = "https://fund.szse.cn/api/report/ShowReport"
 SZSE_FUNDS_REFERER = "https://fund.szse.cn/marketdata/fundslist/index.html"
+
+# 单次切片请求最大尝试次数：切片是整段 XLSX，偶发失败直接放弃会丢掉整片份额数据
+_MAX_ATTEMPTS = 3
 
 
 def split_date_range(start_date: str, end_date: str, max_days: int = 60) -> List[Tuple[str, str]]:
@@ -73,11 +77,32 @@ class SzseShareSource:
             "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*",
         }
 
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-            resp = await client.get(SZSE_SHARE_REPORT_URL, params=params, headers=headers)
-            resp.raise_for_status()
+        last_err: Optional[Exception] = None
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                async with httpx.AsyncClient(
+                    timeout=self.timeout, follow_redirects=True
+                ) as client:
+                    resp = await client.get(
+                        SZSE_SHARE_REPORT_URL, params=params, headers=headers
+                    )
+                    resp.raise_for_status()
+                return self.parse_xlsx_bytes(resp.content)
+            except Exception as e:
+                last_err = e
+                if attempt < _MAX_ATTEMPTS:
+                    backoff = 0.2 * (2 ** (attempt - 1)) + random.uniform(0.05, 0.15)
+                    logger.warning(
+                        f"SZSE share report attempt {attempt}/{_MAX_ATTEMPTS} failed: {e}; "
+                        f"retrying in {backoff:.2f}s"
+                    )
+                    await asyncio.sleep(backoff)
+                else:
+                    logger.error(f"SZSE share report exhausted {_MAX_ATTEMPTS} attempts: {e}")
 
-        return self.parse_xlsx_bytes(resp.content)
+        raise RuntimeError(
+            f"SZSE share report failed after {_MAX_ATTEMPTS} attempts: {last_err}"
+        )
 
     def parse_xlsx_bytes(self, content: bytes) -> Dict[str, List[Dict[str, Any]]]:
         """解析 XLSX 二进制流并按基金代码聚合。"""

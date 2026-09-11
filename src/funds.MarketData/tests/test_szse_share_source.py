@@ -59,3 +59,52 @@ async def test_szse_share_source_parse():
         f_cyb = data["159915"]
         assert len(f_cyb) == 1
         assert f_cyb[0]["shares"] == 150000.0
+
+
+@pytest.mark.asyncio
+async def test_fetch_market_shares_retries_then_succeeds():
+    """切片请求带重试：前两次失败、第三次成功仍须返回结果（不能整片丢数据）。"""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from providers.exchanges.shares.szse import SzseShareSource
+
+    src = SzseShareSource()
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    client = AsyncMock()
+    client.get = AsyncMock(side_effect=[RuntimeError("boom"), RuntimeError("boom"), resp])
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=client)
+    ctx.__aexit__ = AsyncMock(return_value=None)
+
+    with patch("httpx.AsyncClient", return_value=ctx), patch.object(
+        src, "parse_xlsx_bytes", return_value={"159901": []}
+    ), patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        out = await src.fetch_market_shares("2026-01-01", "2026-03-01")
+
+    assert out == {"159901": []}
+    assert client.get.call_count == 3
+    assert mock_sleep.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_market_shares_raises_after_all_attempts():
+    """重试耗尽必须抛错，不能静默返回空市场（会被当成上游无数据）。"""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from providers.exchanges.shares.szse import SzseShareSource
+
+    src = SzseShareSource()
+    client = AsyncMock()
+    client.get = AsyncMock(side_effect=RuntimeError("always down"))
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=client)
+    ctx.__aexit__ = AsyncMock(return_value=None)
+
+    with patch("httpx.AsyncClient", return_value=ctx), patch(
+        "asyncio.sleep", new_callable=AsyncMock
+    ):
+        with pytest.raises(RuntimeError, match="failed after"):
+            await src.fetch_market_shares("2026-01-01", "2026-03-01")
+
+    assert client.get.call_count == 3
