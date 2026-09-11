@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import math
 import pytz
@@ -113,43 +114,67 @@ def get_market_ttl(fast_info) -> int:
         logger.warning(f"Calculate TTL failed: {e}")
         return 600
 
+def _fetch_quote_sync(symbol: str) -> dict:
+    """阻塞式拉取 yfinance 报价原始字段（**必须**在工作线程里调用）。
+
+    Ticker/fast_info 的每个属性访问都可能触发一次网络往返，所以一次性在同一线程里取全，
+    返回纯 Python 值，调用方只做无网络的组装（D6：同步网络调用跑在事件循环上会卡住整个服务）。
+    """
+    ticker = yf.Ticker(symbol, session=_yf_session)
+    fast = ticker.fast_info
+
+    data = {
+        "price": safe_float(getattr(fast, "last_price", 0)),
+        "last_close": safe_float(getattr(fast, "regular_market_previous_close", 0)),
+        "open": safe_float(getattr(fast, "open", 0)),
+        "high": safe_float(getattr(fast, "day_high", 0)),
+        "low": safe_float(getattr(fast, "day_low", 0)),
+        "volume": float(safe_float(getattr(fast, "last_volume", 0))),
+        "currency": getattr(fast, "currency", None),
+        "exchange": getattr(fast, "exchange", None),
+        "ttl": get_market_ttl(fast),
+    }
+
+    # 价格日期（取不到就退回今天，不影响报价主体）
+    try:
+        ts = getattr(fast, "timestamp", None)
+        if ts:
+            data["price_date"] = pd.to_datetime(ts, unit="s", utc=True).strftime("%Y-%m-%d")
+        else:
+            h1 = ticker.history(period="1d", auto_adjust=False)
+            data["price_date"] = (
+                h1.index[-1].strftime("%Y-%m-%d")
+                if not h1.empty
+                else datetime.now().strftime("%Y-%m-%d")
+            )
+    except Exception:
+        data["price_date"] = datetime.now().strftime("%Y-%m-%d")
+
+    return data
+
+
 class YFinanceProvider(BaseProvider):
     async def get_quote(self, symbol: str, with_depth: bool = False) -> Tuple[UnifiedQuote, int]:
         try:
-            ticker = yf.Ticker(symbol, session=_yf_session)
-            fast = ticker.fast_info
-            
-            # 获取基础价格 (安全防御：确保 NaN/None 变为 0)
-            price = safe_float(getattr(fast, 'last_price', 0))
-            last_close = safe_float(getattr(fast, 'regular_market_previous_close', 0))
-            open_val = safe_float(getattr(fast, 'open', 0)) or price
-            high_val = safe_float(getattr(fast, 'day_high', 0)) or price
-            low_val = safe_float(getattr(fast, 'day_low', 0)) or price
+            # D6：yfinance 是同步网络访问，整体搬到工作线程，避免把事件循环卡住数秒。
+            data = await asyncio.to_thread(_fetch_quote_sync, symbol)
 
-            # 确定价格日期
-            price_date = None
-            try:
-                ts = getattr(fast, 'timestamp', None)
-                if ts:
-                    price_date = pd.to_datetime(ts, unit='s', utc=True).strftime('%Y-%m-%d')
-                else:
-                    h1 = ticker.history(period="1d", auto_adjust=False)
-                    price_date = h1.index[-1].strftime('%Y-%m-%d') if not h1.empty else datetime.now().strftime('%Y-%m-%d')
-            except Exception:
-                price_date = datetime.now().strftime('%Y-%m-%d')
+            # 获取基础价格 (安全防御：确保 NaN/None 变为 0)
+            price = data["price"]
+            last_close = data["last_close"]
+            open_val = data["open"] or price
+            high_val = data["high"] or price
+            low_val = data["low"] or price
 
             # 涨跌计算
             change = price - last_close
             percent = (change / last_close * 100.0) if last_close != 0 else 0
-            
-            # 安全转换 Volume
-            raw_vol = getattr(fast, 'last_volume', 0)
-            volume = float(safe_float(raw_vol))
+            volume = data["volume"]
 
             result = UnifiedQuote(
                 symbol=symbol,
                 name=symbol,
-                date=price_date,
+                date=data["price_date"],
                 price=round(price, 4),
                 last_close=round(last_close, 4),
                 change=round(change, 4),
@@ -159,15 +184,14 @@ class YFinanceProvider(BaseProvider):
                 low=round(low_val, 4),
                 volume=volume,
                 amount=round(float(volume) * float(price), 2),
-                currency=getattr(fast, 'currency', None),
-                exchange=getattr(fast, 'exchange', None),
+                currency=data["currency"],
+                exchange=data["exchange"],
                 timestamp=datetime.utcnow().isoformat(),
                 security_type="stock",
                 source="yfinance"
             )
 
-            ttl = get_market_ttl(fast)
-            return result, ttl
+            return result, data["ttl"]
 
         except Exception as e:
             err_msg = str(e)
@@ -179,11 +203,16 @@ class YFinanceProvider(BaseProvider):
     async def get_history(self, symbol: str, period: str, interval: str, 
                           start: Optional[str], end: Optional[str], adj: str) -> dict:
         try:
+            # D6：Ticker 构造本身不打网络，真正的网络访问（history/详情）必须放到工作线程
             ticker = yf.Ticker(symbol, session=_yf_session)
             if start and end:
-                hist = ticker.history(start=start, end=end, interval=interval, auto_adjust=False)
+                hist = await asyncio.to_thread(
+                    ticker.history, start=start, end=end, interval=interval, auto_adjust=False
+                )
             else:
-                hist = ticker.history(period=period, interval=interval, auto_adjust=False)
+                hist = await asyncio.to_thread(
+                    ticker.history, period=period, interval=interval, auto_adjust=False
+                )
 
             # 实时行情补充与追加
             if interval == "1d" and not hist.empty:
@@ -247,7 +276,9 @@ class YFinanceProvider(BaseProvider):
                 anchor = get_cached_anchor(symbol, provider="yfinance")
 
                 if not anchor:
-                    full_hist = ticker.history(period="max", auto_adjust=False)
+                    full_hist = await asyncio.to_thread(
+                        ticker.history, period="max", auto_adjust=False
+                    )
                     if not full_hist.empty:
                         anchor = {"adj_close": float(full_hist.iloc[0]['Adj Close']), "close": float(full_hist.iloc[0]['Close'])}
                         set_cached_anchor(symbol, anchor, provider="yfinance")
@@ -300,7 +331,8 @@ class YFinanceProvider(BaseProvider):
 
     async def get_info(self, symbol: str) -> dict:
         try:
-            return yf.Ticker(symbol, session=_yf_session).info
+            # D6：.info 是同步网络访问（且会拉多个上游接口），必须放到工作线程
+            return await asyncio.to_thread(lambda: yf.Ticker(symbol, session=_yf_session).info)
         except Exception as e:
             logger.error(f"Error fetching info for {symbol} via yfinance: {str(e)}")
             raise e

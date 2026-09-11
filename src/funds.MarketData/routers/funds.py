@@ -2,6 +2,7 @@
 """
 基金数据端点：持仓 / 基本信息 / 东财估值 / 交易所基金列表 / 统一净值。
 """
+import asyncio
 import logging
 from typing import List
 
@@ -64,7 +65,9 @@ async def get_fund_info(
     获取单只公募基金的名称、管理费率、托管费率、成立时间等基本概况。
     """
     try:
-        return eastmoney_provider.get_fund_info(symbol)
+        # D7：get_fund_info 内部是 akshare + pandas 同步抓取，必须下线程执行，
+        # 否则一次调用就把事件循环堵住（同进程其它请求全部排队）。
+        return await asyncio.to_thread(eastmoney_provider.get_fund_info, symbol)
     except Exception as e:
         logger.error(f"Get fund info failed for {symbol}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
