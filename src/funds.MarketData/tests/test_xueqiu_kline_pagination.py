@@ -151,7 +151,10 @@ async def test_xueqiu_kline_parquet_cache_integration(temp_cache_dir, monkeypatc
     assert len(res1["data"]) == 2
 
     # 验证 Parquet 文件已生成
-    p_path, m_path = storage.get_paths("kline", "SH510050", dimensions={"adj": "none", "interval": "1d", "source": "xueqiu"})
+    # 缓存维度已归一化（D26）：adj=normal/before/after、interval=day/week/month
+    p_path, m_path = storage.get_paths(
+        "kline", "SH510050", dimensions={"adj": "normal", "interval": "day", "source": "xueqiu"}
+    )
     assert os.path.exists(p_path)
     assert os.path.exists(m_path)
 
@@ -383,3 +386,31 @@ async def test_empty_later_page_still_ends_normally(monkeypatch):
         )
 
     assert [r["date"] for r in records] == ["2026-09-08"]
+
+
+class _CapturingCacheManager:
+    """只记录 get_or_fetch 的入参，用于断言缓存维度是否被净化。"""
+
+    def __init__(self):
+        self.kwargs = None
+
+    async def get_or_fetch(self, **kwargs):
+        self.kwargs = kwargs
+        return []
+
+
+@pytest.mark.asyncio
+async def test_legacy_get_history_normalizes_cache_dimensions():
+    """legacy get_history（/history/{symbol}）不得把查询参数原样当缓存维度——否则可目录穿越。"""
+    from providers.quotes.xueqiu import XueqiuProvider
+
+    cap = _CapturingCacheManager()
+    provider = XueqiuProvider(cache_manager=cap)
+
+    await provider.get_history(
+        "510300.SH", "1mo", "../../evil", None, None, "../../evil"
+    )
+
+    dims = cap.kwargs["dimensions"]
+    assert dims["adj"] in {"normal", "before", "after"}, dims
+    assert dims["interval"] in {"day", "week", "month"}, dims

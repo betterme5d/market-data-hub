@@ -5,6 +5,7 @@ Parquet 列式存储引擎：支持 Hive-style 多维分区目录、Schema 宽�
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -14,6 +15,25 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+# 缓存路径令牌白名单：只允许字母/数字/下划线/点/连字符。
+# 维度值（如 adj/interval）与 key 都可能来自请求参数，原样拼接会被 ../../ 穿越到其它命名空间
+#（跨命名空间写文件 = 缓存投毒），因此统一在存储层做最后一道拦截。
+_SAFE_PATH_TOKEN = re.compile(r"^[A-Za-z0-9_.\-]+$")
+
+
+def _ensure_safe_path_token(kind: str, value) -> str:
+    """校验缓存路径片段；含分隔符、上跳或非法字符一律抛 ValueError。"""
+    text = str(value)
+    if (
+        not text
+        or text in (".", "..")
+        or "/" in text
+        or "\\" in text
+        or not _SAFE_PATH_TOKEN.match(text)
+    ):
+        raise ValueError(f"unsafe {kind} for cache path: {value!r}")
+    return text
 
 
 class ParquetStorageEngine:
@@ -65,13 +85,23 @@ class ParquetStorageEngine:
         获取指定数据项的 Parquet 文件路径与 Meta JSON 路径。
         维度字典会自动按 Key 排序生成 Hive-style 目录 (例如 source=eastmoney/adj=hfq)。
         """
-        folder = self.base_dir / namespace
+        folder = self.base_dir / _ensure_safe_path_token("namespace", namespace)
         if dimensions:
             for k, v in sorted(dimensions.items()):
-                folder = folder / f"{k}={v}"
+                dim_key = _ensure_safe_path_token("dimension key", k)
+                dim_val = _ensure_safe_path_token(f"dimension value of {k}", v)
+                folder = folder / f"{dim_key}={dim_val}"
 
-        p_path = folder / f"{key}.parquet"
-        m_path = folder / f"{key}.meta.json"
+        safe_key = _ensure_safe_path_token("key", key)
+        p_path = folder / f"{safe_key}.parquet"
+        m_path = folder / f"{safe_key}.meta.json"
+
+        # 双保险：解析后的路径必须仍在 base_dir 之内
+        base_resolved = Path(self.base_dir).resolve()
+        target_resolved = Path(p_path).resolve()
+        if target_resolved != base_resolved and base_resolved not in target_resolved.parents:
+            raise ValueError(f"cache path escapes base dir: {target_resolved}")
+
         return str(p_path), str(m_path)
 
     def read_metadata(

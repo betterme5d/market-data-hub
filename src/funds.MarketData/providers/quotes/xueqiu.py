@@ -508,8 +508,8 @@ class XueqiuProvider(BaseProvider):
             period_str = "week"
         elif interval in ["1mo", "month", "monthly"]:
             period_str = "month"
-        elif interval:
-            period_str = interval
+        # 未知周期一律回落 day：缓存维度与上游请求必须用同一个值，
+        # 否则会把 A 周期数据缓存到 B 周期的 key 上（且估算器只支持 day/week/month）
 
         # 3. 规范化 start 与 end 日期
         today_str = date.today().strftime("%Y-%m-%d")
@@ -535,8 +535,9 @@ class XueqiuProvider(BaseProvider):
         upper_symbol = normalize_xueqiu_symbol(symbol)
         dimensions = {
             "source": "xueqiu",
-            "adj": adj_norm,
-            "interval": interval or "1d"
+            # adj / interval 来自查询参数：必须用归一化后的值，原样拼路径会造成缓存目录穿越
+            "adj": adjust_type,
+            "interval": period_str,
         }
 
         async def fetch_fn(s_slice: str, e_slice: str, on_chunk=None):

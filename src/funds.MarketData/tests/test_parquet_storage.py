@@ -128,3 +128,30 @@ def test_concurrent_writes_to_same_key_do_not_lose_rows():
 
         got = {r["date"] for r in engine.read_records("fund_nav", "concurrent_key", date_column="date")}
         assert got == expected, f"第 {round_no + 1} 轮并发写丢行: 缺 {sorted(expected - got)}"
+
+
+def test_get_paths_rejects_path_traversal_in_dimension():
+    """维度值含路径分隔符或上跳 → 必须拒绝（防缓存目录穿越/投毒）。"""
+    engine = ParquetStorageEngine(base_dir=TEST_CACHE_DIR)
+    for bad in ["../../evil", "..", ".", "a/b", "a\\b", "..\\..\\evil", "x/../../y", "C:evil"]:
+        with pytest.raises(ValueError):
+            engine.get_paths("kline", "SH510300", {"source": "xueqiu", "interval": bad})
+
+
+def test_get_paths_rejects_path_traversal_in_key():
+    """缓存 key（代码）同样不允许路径分隔符或上跳。"""
+    engine = ParquetStorageEngine(base_dir=TEST_CACHE_DIR)
+    for bad in ["../../evil", "a/b", "..\\evil", ".."]:
+        with pytest.raises(ValueError):
+            engine.get_paths("kline", bad, {"source": "xueqiu"})
+
+
+def test_get_paths_accepts_normal_symbols_and_dimensions():
+    """正常的符号（含 .US/.FX 这类带点形态）与维度值必须仍然可用。"""
+    engine = ParquetStorageEngine(base_dir=TEST_CACHE_DIR)
+    for key in ["510300", "SH510300", ".SPGSCL", "HKDCNY.FX", "CSI930875", "00700"]:
+        p_path, m_path = engine.get_paths(
+            "kline", key, {"source": "xueqiu", "adjust": "hfq", "period": "day"}
+        )
+        assert p_path.endswith(key + ".parquet")
+        assert m_path.endswith(key + ".meta.json")
