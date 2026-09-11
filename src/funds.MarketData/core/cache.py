@@ -1,28 +1,44 @@
-import os
-import redis
 import json
 import logging
 from typing import Optional
 
+import redis
+
+from core import config
+
 logger = logging.getLogger(__name__)
 
-REDIS_HOST = os.getenv("VALKEY_HOST", "valkey")
-REDIS_PORT = int(os.getenv("VALKEY_PORT", 6380))
-REDIS_PWD = os.getenv("VALKEY_PASSWORD", "")
+# 兼容旧引用（配置统一走 core.config）
+REDIS_HOST = config.VALKEY_HOST
+REDIS_PORT = config.VALKEY_PORT
+REDIS_PWD = config.VALKEY_PASSWORD
 
-try:
-    redis_client = redis.Redis(
-        host=REDIS_HOST,
-        port=REDIS_PORT,
-        password=REDIS_PWD,
-        decode_responses=True,
-        socket_timeout=5
-    )
-    redis_client.ping()
-    logger.info(f"Successfully connected to Valkey at {REDIS_HOST}:{REDIS_PORT}")
-except Exception as r_ex:
-    logger.error(f"Failed to connect to Valkey: {r_ex}")
-    redis_client = None
+
+def _create_client():
+    """创建 Valkey 客户端（惰性连接）。
+
+    刻意**不在导入期 ping**：Valkey 若在进程启动瞬间抖动一次，旧实现会把 redis_client 永久置为 None，
+    导致行情缓存、熔断、健康指标、雪球 Cookie 共享全部失效直到进程重启。
+    redis.Redis 本身是惰性连接（构造不建连），各调用点均已各自 try/except 容错，按调用失败降级即可。
+    """
+    try:
+        return redis.Redis(
+            host=config.VALKEY_HOST,
+            port=config.VALKEY_PORT,
+            password=config.VALKEY_PASSWORD,
+            decode_responses=True,
+            socket_timeout=5,
+            socket_connect_timeout=2,
+        )
+    except Exception as e:
+        logger.error(f"Failed to create Valkey client: {e}")
+        return None
+
+
+redis_client = _create_client()
+
+if redis_client is not None:
+    logger.info(f"Valkey client created for {REDIS_HOST}:{REDIS_PORT} (lazy connect)")
 
 def get_cached_quote(symbol: str, provider: str = "yfinance") -> Optional[dict]:
     if not redis_client:
