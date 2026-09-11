@@ -38,6 +38,22 @@ SEMAPHORES = {
 
 # 默认缓存时间 (交易时段 10 秒)
 DEFAULT_CACHE_TTL = 10
+# 源级默认 TTL（秒）：批量接口拿不到 provider 的动态 TTL（yfinance 单条路径是 600s~3天，
+# 见 get_market_ttl），若统一按 DEFAULT_CACHE_TTL 写会让 yfinance 60 倍地打上游。
+SOURCE_CACHE_TTL = {
+    "yfinance": 600,
+}
+
+
+def _source_allowed(cached_source: Optional[str], allowed_sources: Dict[str, str]) -> bool:
+    """缓存命中校验：缓存里的来源必须落在本次请求允许的源内。
+
+    否则显式指定 source（如 ?source=tencent）会被其它源的旧缓存绕过。
+    allowed_sources 为空表示不限制来源。
+    """
+    if not allowed_sources:
+        return True
+    return (cached_source or "").lower() in {s.lower() for s in allowed_sources.keys()}
 # 故障熔断隔离时间 (300 秒 = 5 分钟)
 CIRCUIT_BREAKER_TTL = 300
 # 允许的最大连续错误次数 (触发熔断的阈值)
@@ -181,7 +197,13 @@ class QuoteDispatcher:
             try:
                 cached = redis_client.get(cache_key)
                 if cached:
-                    return UnifiedQuote.model_validate_json(cached)
+                    cached_quote = UnifiedQuote.model_validate_json(cached)
+                    if _source_allowed(cached_quote.source, allowed_sources):
+                        return cached_quote
+                    logger.debug(
+                        f"Quote cache for {symbol} came from '{cached_quote.source}' not in "
+                        f"allowed sources {list(allowed_sources)}; refetching"
+                    )
             except Exception as ce:
                 logger.warning(f"Read quote cache failed for {symbol}: {ce}")
 
@@ -257,13 +279,19 @@ class QuoteDispatcher:
                 cache_keys = [get_quote_cache_key(item["symbol"]) for item in items]
                 cached_values = redis_client.mget(cache_keys)
                 for item, cached_val in zip(items, cached_values):
-                    if cached_val:
-                        try:
-                            q = UnifiedQuote.model_validate_json(cached_val)
-                            results_map[item["symbol"].lower()] = q
-                            logger.debug(f"Valkey cache hit for batch symbol: {item['symbol']}")
-                        except Exception:
-                            pass
+                    if not cached_val:
+                        continue
+                    try:
+                        q = UnifiedQuote.model_validate_json(cached_val)
+                    except Exception:
+                        continue
+                    if not _source_allowed(q.source, item.get("allowed_sources") or {}):
+                        logger.debug(
+                            f"Batch cache for {item['symbol']} came from '{q.source}' not allowed; refetching"
+                        )
+                        continue
+                    results_map[item["symbol"].lower()] = q
+                    logger.debug(f"Valkey cache hit for batch symbol: {item['symbol']}")
             except Exception as e:
                 logger.warning(f"MGET cache failed: {e}")
 
@@ -371,7 +399,12 @@ class QuoteDispatcher:
                         # 仅在不带深度数据时写入 Redis 缓存
                         if not with_depth and redis_client:
                             try:
-                                redis_client.setex(get_quote_cache_key(std_sym), DEFAULT_CACHE_TTL, q.model_dump_json())
+                                ttl = SOURCE_CACHE_TTL.get(
+                                    (q.source or "").lower(), DEFAULT_CACHE_TTL
+                                )
+                                redis_client.setex(
+                                    get_quote_cache_key(std_sym), ttl, q.model_dump_json()
+                                )
                                 logger.debug(f"Successfully cached batch quote for {std_sym} to Valkey, ttl={DEFAULT_CACHE_TTL}")
                             except Exception:
                                 pass

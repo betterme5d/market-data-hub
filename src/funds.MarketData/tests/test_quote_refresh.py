@@ -16,6 +16,7 @@ class _FakeRedis:
         self.store = dict(initial or {})
         self.get_calls = 0
         self.setex_calls = 0
+        self.setex_args = []  # [(key, ttl), ...]
 
     def get(self, key):
         self.get_calls += 1
@@ -23,6 +24,7 @@ class _FakeRedis:
 
     def setex(self, key, ttl, value):
         self.setex_calls += 1
+        self.setex_args.append((key, ttl))
         self.store[key] = value
 
     def exists(self, key):
@@ -71,3 +73,44 @@ async def test_quote_refresh_bypasses_cache_read_but_still_writes():
 
     assert fake.get_calls == 1, "refresh=True 不应再读缓存"
     assert fake.setex_calls >= 1, "方案A：刷新结果要回写缓存"
+
+
+@pytest.mark.asyncio
+async def test_single_cache_hit_rejected_when_source_not_allowed():
+    """显式指定 source 时，不得被其它源的缓存命中绕过。"""
+    cached = UnifiedQuote(
+        symbol="510300", name="sina缓存", price=1.0, date="2026-09-11", source="sina"
+    )
+    fresh = UnifiedQuote(
+        symbol="510300", name="tencent上游", price=2.0, date="2026-09-11", source="tencent"
+    )
+    fake = _FakeRedis({get_quote_cache_key("510300"): cached.model_dump_json()})
+    provider = MagicMock()
+    provider.get_quote = AsyncMock(return_value=(fresh, 10))
+
+    with patch("core.dispatcher.redis_client", fake), patch.dict(
+        "core.dispatcher.PROVIDERS", {"tencent": provider}, clear=False
+    ), patch.dict("core.dispatcher.SEMAPHORES", {"tencent": asyncio.Semaphore(1)}, clear=False):
+        got = await QuoteDispatcher.get_quote_with_fallback("510300", {"tencent": "sh510300"})
+
+    assert got.name == "tencent上游"
+    assert provider.get_quote.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_cache_write_uses_source_ttl():
+    """批量写缓存必须按源取 TTL：yfinance 不能沿用写死的 10 秒。"""
+    fake = _FakeRedis()
+    quote = UnifiedQuote(
+        symbol="AAPL", name="上游值", price=200.0, date="2026-09-11", source="yfinance"
+    )
+    provider = MagicMock()
+    provider.get_quotes = AsyncMock(return_value={"AAPL": quote})
+
+    with patch("core.dispatcher.redis_client", fake), patch.dict(
+        "core.dispatcher.PROVIDERS", {"yfinance": provider}, clear=False
+    ), patch.dict("core.dispatcher.SEMAPHORES", {"yfinance": asyncio.Semaphore(1)}, clear=False):
+        await QuoteDispatcher.get_quotes_batch([{"symbol": "AAPL", "allowed_sources": {"yfinance": "AAPL"}}])
+
+    assert fake.setex_args, "必须写入缓存"
+    assert fake.setex_args[-1][1] >= 600, fake.setex_args
