@@ -104,6 +104,52 @@ async def test_incremental_extension():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "start_date,end_date",
+    [
+        ("2020-01-01", "2020-12-31"),
+        (
+            (date.today() - timedelta(days=3)).strftime("%Y-%m-%d"),
+            date.today().strftime("%Y-%m-%d"),
+        ),
+    ],
+)
+async def test_empty_chunk_does_not_claim_coverage(start_date, end_date):
+    """空响应（可能是上游静默失败）不能记为已覆盖：不写 intervals，下次必须重问上游。"""
+    manager = TimeSeriesCacheManager(base_dir=TEST_CACHE_DIR)
+
+    async def empty_streaming_fetch(s, e, on_chunk=None):
+        # 模拟爬虫拿到空页：不触发任何 on_chunk，返回空列表
+        return []
+
+    res = await manager.get_or_fetch(
+        namespace="fund_nav",
+        key="012345",
+        start_date=start_date,
+        end_date=end_date,
+        fetch_fn=empty_streaming_fetch,
+        date_column="nav_date",
+    )
+    assert res == []
+    meta = manager.storage.read_metadata("fund_nav", "012345")
+    assert (meta or {}).get("intervals", []) == []
+
+    # 上游恢复后重跑：缺口仍视为缺失，整段重取而不是命中"空缓存"
+    fetch_mock = AsyncMock(return_value=[{"nav_date": start_date, "unit_nav": 1.23}])
+    res2 = await manager.get_or_fetch(
+        namespace="fund_nav",
+        key="012345",
+        start_date=start_date,
+        end_date=end_date,
+        fetch_fn=fetch_mock,
+        date_column="nav_date",
+    )
+    assert fetch_mock.call_count == 1
+    assert fetch_mock.await_args.args[:2] == (start_date, end_date)
+    assert [r["nav_date"] for r in res2] == [start_date]
+
+
+@pytest.mark.asyncio
 async def test_concurrency_lock():
     manager = TimeSeriesCacheManager(base_dir=TEST_CACHE_DIR)
 

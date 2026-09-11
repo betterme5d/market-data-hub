@@ -153,9 +153,15 @@ class PaginatedSliceCrawler:
                             effective_upper = min(effective_upper, yesterday_str)
 
                     if not page_items:
-                        # 空数据：说明该区间上游无任何数据
-                        if effective_lower and effective_upper and effective_lower <= effective_upper:
-                            await on_page([], effective_lower, effective_upper)
+                        # 空数据：**不能**把它记为"该区间已覆盖"。
+                        # 上游静默失败（限流/接口异常返回空）与"确实没有数据"从响应上无法区分，
+                        # 一旦记为已覆盖，之后重跑只会从缓存拿到空、永远不再问上游，错误被静默固化。
+                        # 代价：真没数据的窗口每次补录会重问一次上游（一次请求，可接受）；
+                        # 需要彻底停止重问时由人工在明细里标"人工忽略"。
+                        logger.warning(
+                            f"crawl_slice got an empty page for [{start_date} ~ {end_date}]; "
+                            f"该区间不记为已覆盖（可能是上游失败），下次会重取"
+                        )
                     else:
                         page_min_date = min(date_getter(r) for r in page_items)
                         # 最后一页时，覆盖下界延伸至切片起始日期 effective_lower
@@ -167,8 +173,11 @@ class PaginatedSliceCrawler:
                 else:  # order == "asc"
                     # 正序：第一页包含最旧的日期，往后拉到最新
                     if not page_items:
-                        if effective_lower and effective_upper and effective_lower <= effective_upper:
-                            await on_page([], effective_lower, effective_upper)
+                        # 同上：空页不记覆盖
+                        logger.warning(
+                            f"crawl_slice got an empty page for [{start_date} ~ {end_date}]; "
+                            f"该区间不记为已覆盖（可能是上游失败），下次会重取"
+                        )
                     else:
                         page_max_date = max(date_getter(r) for r in page_items)
                         # 如果最新页包含 today，检查是否到了 today

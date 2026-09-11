@@ -135,9 +135,12 @@ class FundShareResponse(BaseModel):
     """统一基金份额接口响应包装。"""
 
     code: str  # 基金代码
-    exchange: str = "szse"  # 交易所标识 (szse | sse)
+    exchange: str  # 交易所标识 (szse | sse)
     count: int  # 本批条数
     items: List[FundShare] = []
+    # 本区间内"上游某个分类接口失败、没能取全"的交易日（沪市逐日拉取才有）：
+    # 调用方（C#）必须把这些日子排除在"上游无数据"标注之外，留给下次重取。
+    incomplete_days: List[str] = []
 
 
 class KLineBar(BaseModel):

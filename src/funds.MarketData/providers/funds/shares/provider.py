@@ -62,6 +62,7 @@ class FundShareProvider:
         start_date: str,
         end_date: str,
         exchange: Optional[str] = None,
+        incomplete_days: Optional[List[str]] = None,
     ) -> List[FundShare]:
         """
         获取指定基金在 [start_date, end_date] 区间的历史份额数据。
@@ -124,7 +125,8 @@ class FundShareProvider:
                                 self._dispatch_fanout_sync(window, clean_code, w_start, w_end, dims, namespace)
 
                             market_data = await self.sse_source.fetch_market_shares_range(
-                                s_slice, e_slice, on_window=_on_window
+                                s_slice, e_slice, on_window=_on_window,
+                                incomplete_days_out=incomplete_days,
                             )
                             if not flushed and market_data:
                                 # 回调一次都没触发（旧实现/测试桩）：退回"整段一次"落盘与标记

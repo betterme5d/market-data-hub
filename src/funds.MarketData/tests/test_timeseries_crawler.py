@@ -162,7 +162,8 @@ async def test_crawler_exhaust_retries_and_partial_failure():
 
 
 @pytest.mark.asyncio
-async def test_crawler_empty_page_covers_interval():
+async def test_crawler_empty_page_does_not_claim_coverage():
+    """空页不再记为"已覆盖"：上游静默失败与真无数据不可区分，记覆盖会把错误静默固化。"""
     crawler = PaginatedSliceCrawler()
 
     fetch_mock = AsyncMock(return_value=PageBatch(items=[]))
@@ -181,10 +182,8 @@ async def test_crawler_empty_page_covers_interval():
     )
 
     assert res == []
-    assert len(callback_calls) == 1
-    assert callback_calls[0][0] == []
-    assert callback_calls[0][1] == "2024-10-01"
-    assert callback_calls[0][2] == "2024-10-07"
+    # 空结果不触发 on_page（不写覆盖区间），留给下次重取
+    assert callback_calls == []
 
 
 @pytest.mark.asyncio

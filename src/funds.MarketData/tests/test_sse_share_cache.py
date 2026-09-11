@@ -71,3 +71,24 @@ async def test_provider_only_fetches_after_2012_boundary(tmp_path: Path):
     args = mock_sse.fetch_market_shares_range.call_args.args
     assert args[0] == "2012-01-04"
     assert args[1] == "2012-01-31"
+
+
+@pytest.mark.asyncio
+async def test_provider_surfaces_incomplete_days(tmp_path: Path):
+    """沪市某个分类接口失败的日子要透给调用方（C#），否则会被误标成"上游无数据"。"""
+    storage = ParquetStorageEngine(base_dir=tmp_path)
+    mock_sse = AsyncMock(spec=SseShareSource)
+
+    async def fake_range(s, e, on_window=None, **kwargs):
+        out = kwargs.get("incomplete_days_out")
+        if out is not None:
+            out.append("2026-06-24")
+        return {}
+
+    mock_sse.fetch_market_shares_range.side_effect = fake_range
+    provider = FundShareProvider(storage=storage, tracker=IntervalTracker(), sse_source=mock_sse)
+
+    incomplete: list[str] = []
+    await provider.get_fund_shares("510050", "2026-06-01", "2026-06-30", incomplete_days=incomplete)
+
+    assert incomplete == ["2026-06-24"]

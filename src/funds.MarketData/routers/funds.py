@@ -3,6 +3,7 @@
 基金数据端点：持仓 / 基本信息 / 东财估值 / 交易所基金列表 / 统一净值。
 """
 import logging
+from typing import List
 
 from fastapi import APIRouter, Header, HTTPException, Path, Query, Request
 
@@ -373,8 +374,14 @@ async def get_fund_shares(
         )
 
     try:
-        items = await fund_share_provider.get_fund_shares(clean_code, s_date, e_date, exchange=resolved_exchange)
-        return FundShareResponse(code=clean_code, exchange=resolved_exchange, count=len(items), items=items)
+        incomplete: List[str] = []
+        items = await fund_share_provider.get_fund_shares(
+            clean_code, s_date, e_date, exchange=resolved_exchange, incomplete_days=incomplete
+        )
+        return FundShareResponse(
+            code=clean_code, exchange=resolved_exchange, count=len(items), items=items,
+            incomplete_days=sorted(set(incomplete)),
+        )
     except Exception as e:
         logger.exception(f"Failed to get fund shares for {clean_code} ({s_date} ~ {e_date}): {e}")
         raise HTTPException(status_code=502, detail=f"Get fund shares failed: {e}")

@@ -397,15 +397,29 @@ class XueqiuProvider(BaseProvider):
                     column = data.get("column", [])
                     items = data.get("item", [])
                     if not items:
-                        # 空结果会被缓存管理器记为「该区间已覆盖」，符号写错或上游异常会因此静默固化，故用 WARNING
-                        logger.warning(
-                            f"Xueqiu KLine returned empty items for {upper_symbol} at {current_end_ts} "
-                            f"(slice {slice_start}~{slice_end}); 该区间将被标记为已覆盖，请确认符号有效"
+                        # 首屏就空必须抛异常，不能返回空：空结果会被缓存管理器记为「该区间已覆盖」，
+                        # 之后重跑直接从缓存返回空、永远不再问上游；上层 C# 还会把整段标成"上游无数据"
+                        # （实证：160324/161038/511260/512570 雪球各有 1500~2200 根 K 线，却被整段误标）。
+                        # 只有翻到后面的页才空，才是正常的"触底回到历史起点"。
+                        if page == 1:   # 首次翻页（本函数从 page=1 开始）
+                            raise BusinessException(
+                                f"Xueqiu KLine returned empty items for {upper_symbol} "
+                                f"(slice {slice_start}~{slice_end}); 首屏无数据，按失败处理（不写缓存覆盖、不标上游无）"
+                            )
+                        logger.debug(
+                            f"Xueqiu KLine pages exhausted for {upper_symbol} at {current_end_ts} "
+                            f"(slice {slice_start}~{slice_end})"
                         )
                         break
 
                     parsed_page = self._parse_kline_items(column, items)
                     if not parsed_page:
+                        # 解析后为空同样按失败处理（首屏）——例如字段结构变了但 HTTP 仍 200
+                        if page == 1:   # 首次翻页（本函数从 page=1 开始）
+                            raise BusinessException(
+                                f"Xueqiu KLine parsed to empty for {upper_symbol} "
+                                f"(slice {slice_start}~{slice_end}); 解析结果为空，按失败处理"
+                            )
                         break
 
                     # 去重并收集新记录

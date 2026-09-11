@@ -173,7 +173,15 @@ class TimeSeriesCacheManager:
 
                     # 回退机制：若 fetch_fn 未触发 _on_chunk，执行全切片整体落盘
                     if not chunk_called:
-                        if chunk:
+                        if not chunk:
+                            # 空响应：与 PaginatedSliceCrawler 的空页处理一致，**不能**记为"该区间已覆盖"。
+                            # 上游静默失败（限流/接口异常返回空）与"确实没有数据"从响应上无法区分，
+                            # 一旦记为已覆盖，之后重跑只会从缓存拿到空、永远不再问上游，错误被静默固化。
+                            logger.warning(
+                                f"{namespace}/{key} slice [{s_slice} ~ {e_slice}] returned empty; "
+                                f"该区间不记为已覆盖（可能是上游失败），下次会重取"
+                            )
+                        else:
                             self.storage.write_records(
                                 namespace,
                                 key,
@@ -181,28 +189,28 @@ class TimeSeriesCacheManager:
                                 date_column=date_column,
                                 dimensions=dimensions,
                             )
-                        has_today = any(
-                            str(r.get(date_column)) == today_str for r in (chunk or [])
-                        )
-                        if e_slice >= today_str and not has_today:
-                            self._mark_today_pending(lock_key)
-                            if s_slice <= yesterday_str:
-                                intervals = self.tracker.merge_intervals(
-                                    intervals, (s_slice, min(e_slice, yesterday_str))
-                                )
-                        else:
-                            intervals = self.tracker.merge_intervals(intervals, (s_slice, e_slice))
+                            has_today = any(
+                                str(r.get(date_column)) == today_str for r in chunk
+                            )
+                            if e_slice >= today_str and not has_today:
+                                self._mark_today_pending(lock_key)
+                                if s_slice <= yesterday_str:
+                                    intervals = self.tracker.merge_intervals(
+                                        intervals, (s_slice, min(e_slice, yesterday_str))
+                                    )
+                            else:
+                                intervals = self.tracker.merge_intervals(intervals, (s_slice, e_slice))
 
-                        meta["key"] = key
-                        meta["namespace"] = namespace
-                        if dimensions:
-                            meta["dimensions"] = dimensions
-                        meta["intervals"] = intervals
-                        meta["date_column"] = date_column
-                        meta["updated_at"] = datetime.now().isoformat()
-                        self.storage.write_metadata(
-                            namespace, key, meta, dimensions=dimensions
-                        )
+                            meta["key"] = key
+                            meta["namespace"] = namespace
+                            if dimensions:
+                                meta["dimensions"] = dimensions
+                            meta["intervals"] = intervals
+                            meta["date_column"] = date_column
+                            meta["updated_at"] = datetime.now().isoformat()
+                            self.storage.write_metadata(
+                                namespace, key, meta, dimensions=dimensions
+                            )
 
             return self.storage.read_records(
                 namespace,

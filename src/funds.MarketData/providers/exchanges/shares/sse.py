@@ -247,6 +247,7 @@ class SseShareSource:
         end_date: str,
         on_window: Optional[Callable[[Dict[str, List[Dict[str, Any]]], str, str], None]] = None,
         flush_every_days: int = SSE_SHARE_FLUSH_EVERY_DAYS,
+        incomplete_days_out: Optional[List[str]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
         利用交易日历筛选有效交易日，对齐 C# 串行逐日拉取并加入安全礼貌延时。
@@ -329,6 +330,8 @@ class SseShareSource:
                     f"(last trading day {trading_days[-1]}); partial data persisted."
                 )
             if incomplete_days:
+                if incomplete_days_out is not None:
+                    incomplete_days_out.extend(incomplete_days)
                 logger.warning(
                     f"SSE range fetch for [{start_date} ~ {end_date}] got incomplete market data on "
                     f"{len(incomplete_days)} day(s) {incomplete_days[:5]}; those days stay uncovered for retry."

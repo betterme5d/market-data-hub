@@ -318,3 +318,68 @@ async def test_today_only_slice_does_not_claim_today(monkeypatch):
     assert len(chunk_calls) == 1
     assert today_str not in chunk_calls[0][1:]
     assert chunk_calls[0][1:] == (yesterday_str, yesterday_str)
+
+
+@pytest.mark.asyncio
+async def test_empty_first_page_raises_instead_of_returning_empty(monkeypatch):
+    """首屏返回空必须抛异常：返回空会被缓存记为「已覆盖」、被 C# 标成"上游无数据"并永久固化。
+
+    实证：160324/161038/511260/512570 雪球各有 1500~2200 根 K 线，却因一次静默空被整段误标。
+    """
+    from core.exceptions import BusinessException
+
+    provider = XueqiuProvider()
+    monkeypatch.setattr(provider, "_ensure_cookie", AsyncMock(return_value=("fake_cookie", "fake_ua")))
+
+    async def mock_get(url, headers, timeout=None):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"error_code": 0, "data": {"column": KLINE_COLUMNS, "item": []}}
+        return resp
+
+    with patch("httpx.AsyncClient.get", side_effect=mock_get):
+        with pytest.raises(BusinessException):
+            await provider._fetch_kline_slice(
+                symbol="SZ160324",
+                slice_start="2017-08-08",
+                slice_end="2026-09-10",
+                period_str="day",
+                adjust_type="normal",
+            )
+
+
+@pytest.mark.asyncio
+async def test_empty_later_page_still_ends_normally(monkeypatch):
+    """翻到后面的页才空 = 已触底回到历史起点，属正常结束，不能抛异常。"""
+    provider = XueqiuProvider()
+    monkeypatch.setattr(provider, "_ensure_cookie", AsyncMock(return_value=("fake_cookie", "fake_ua")))
+
+    page1_items = [[_ts(2026, 9, 8), 100, 1.0, 1.1, 0.9, 1.05, 0.05, 5.0, 1.0, 1000.0]]
+    call_count = 0
+
+    async def mock_get(url, headers, timeout=None):
+        nonlocal call_count
+        call_count += 1
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = (
+            {"error_code": 0, "data": {"column": KLINE_COLUMNS, "item": page1_items}}
+            if call_count == 1
+            else {"error_code": 0, "data": {"column": KLINE_COLUMNS, "item": []}}
+        )
+        return resp
+
+    async def mock_sleep(sec):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", mock_sleep)
+    with patch("httpx.AsyncClient.get", side_effect=mock_get):
+        records = await provider._fetch_kline_slice(
+            symbol="SZ160324",
+            slice_start="2005-01-01",
+            slice_end="2026-09-10",
+            period_str="day",
+            adjust_type="normal",
+        )
+
+    assert [r["date"] for r in records] == ["2026-09-08"]

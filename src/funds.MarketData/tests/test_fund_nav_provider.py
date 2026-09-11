@@ -52,6 +52,43 @@ async def test_get_fund_nav_history_cached():
 
 
 @pytest.mark.asyncio
+async def test_empty_upstream_response_does_not_poison_coverage():
+    """上游静默失败（ErrCode=0 但列表为空）不得写入覆盖区间，否则重跑永远只命中空缓存。
+    端到端链路：FundNavProvider → TimeSeriesCacheManager → EastmoneySource（真实分页爬虫）。"""
+    from providers.funds.eastmoney import EastmoneySource
+
+    cache_manager = TimeSeriesCacheManager(base_dir=TEST_CACHE_DIR)
+    em = EastmoneySource()
+    provider = FundNavProvider(cache_manager=cache_manager, eastmoney_source=em)
+
+    empty_page = {"ErrCode": "0", "TotalCount": "0", "Data": {"LSJZList": []}}
+    with patch.object(em, "_fetch_lsjz_page", return_value=empty_page) as mock_page:
+        res = await provider.get_fund_nav_history("159976", "2020-01-01", "2020-12-31", source="eastmoney")
+        assert res == []
+
+        # 空响应不记覆盖：meta 里不能出现任何 intervals
+        meta = cache_manager.storage.read_metadata(
+            "fund_nav", "159976", dimensions={"source": "eastmoney"}
+        )
+        assert (meta or {}).get("intervals", []) == []
+
+        # 上游恢复后重跑：缺口仍视为缺失，必须重新问上游并正常落盘
+        mock_page.return_value = {
+            "ErrCode": "0",
+            "TotalCount": "1",
+            "Data": {"LSJZList": [{"FSRQ": "2020-06-30", "DWJZ": "1.5000", "LJJZ": "1.6000"}]},
+        }
+        res2 = await provider.get_fund_nav_history("159976", "2020-01-01", "2020-12-31", source="eastmoney")
+        assert [r.nav_date for r in res2] == ["2020-06-30"]
+        assert mock_page.call_count == 2
+
+        meta2 = cache_manager.storage.read_metadata(
+            "fund_nav", "159976", dimensions={"source": "eastmoney"}
+        )
+        assert meta2["intervals"] == [["2020-01-01", "2020-12-31"]]
+
+
+@pytest.mark.asyncio
 async def test_source_selection():
     cache_manager = TimeSeriesCacheManager(base_dir=TEST_CACHE_DIR)
     mock_em = AsyncMock()
