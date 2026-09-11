@@ -336,18 +336,24 @@ class FundShareProvider:
         dims: Dict[str, str],
         namespace: str,
     ) -> None:
-        """更新单只基金的覆盖区间元数据。"""
-        f_meta = self.storage.read_metadata(namespace, fund_code, dimensions=dims) or {}
-        f_intervals = f_meta.get("intervals", [])
-        merged_intervals = self.tracker.merge_intervals(f_intervals, (chunk_s, chunk_e))
+        """更新单只基金的覆盖区间元数据。
 
-        f_meta["key"] = fund_code
-        f_meta["namespace"] = namespace
-        f_meta["dimensions"] = dims
-        f_meta["intervals"] = merged_intervals
-        f_meta["date_column"] = "share_date"
-        f_meta["updated_at"] = datetime.now().isoformat()
-        self.storage.write_metadata(namespace, fund_code, f_meta, dimensions=dims)
+        必须走 storage.update_metadata（读-改-写全程持锁）：扇出后台任务与后续请求会并发更新
+        同一只基金，自己 read+write 会「读旧值 → 各自合并 → 后写覆盖先写」而丢区间。
+        """
+
+        def _mutate(meta: Dict[str, Any]) -> Dict[str, Any]:
+            meta["key"] = fund_code
+            meta["namespace"] = namespace
+            meta["dimensions"] = dims
+            meta["intervals"] = self.tracker.merge_intervals(
+                meta.get("intervals", []), (chunk_s, chunk_e)
+            )
+            meta["date_column"] = "share_date"
+            meta["updated_at"] = datetime.now().isoformat()
+            return meta
+
+        self.storage.update_metadata(namespace, fund_code, _mutate, dimensions=dims)
 
 
 # 全局单例

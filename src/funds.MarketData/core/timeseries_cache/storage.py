@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -104,6 +104,18 @@ class ParquetStorageEngine:
 
         return str(p_path), str(m_path)
 
+    @staticmethod
+    def _read_metadata_unlocked(m_path: str) -> Optional[Dict[str, Any]]:
+        """读取元数据文件（不加锁；并发控制由调用方负责）。"""
+        if not os.path.exists(m_path):
+            return None
+        try:
+            with open(m_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to read metadata {m_path}: {e}")
+            return None
+
     def read_metadata(
         self,
         namespace: str,
@@ -112,14 +124,21 @@ class ParquetStorageEngine:
     ) -> Optional[Dict[str, Any]]:
         """读取元数据 JSON 文件。若不存在返回 None。"""
         _, m_path = self.get_paths(namespace, key, dimensions)
-        if not os.path.exists(m_path):
-            return None
+        return self._read_metadata_unlocked(m_path)
+
+    def _write_metadata_unlocked(self, m_path: str, metadata: Dict[str, Any]) -> None:
+        """原子写入元数据文件（不加锁；并发控制由调用方负责）。"""
+        os.makedirs(os.path.dirname(m_path), exist_ok=True)
+        tmp_path = f"{m_path}.tmp.{uuid.uuid4().hex}"
         try:
-            with open(m_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+            self._atomic_replace(tmp_path, m_path)
         except Exception as e:
-            logger.warning(f"Failed to read metadata for {namespace}/{key}: {e}")
-            return None
+            logger.error(f"Failed to write metadata {m_path}: {e}")
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
 
     def write_metadata(
         self,
@@ -130,18 +149,27 @@ class ParquetStorageEngine:
     ) -> None:
         """原子写入元数据 JSON 文件（同 key 串行）。"""
         _, m_path = self.get_paths(namespace, key, dimensions)
-        os.makedirs(os.path.dirname(m_path), exist_ok=True)
-        tmp_path = f"{m_path}.tmp.{uuid.uuid4().hex}"
         with self._get_write_lock(m_path):
-            try:
-                with open(tmp_path, "w", encoding="utf-8") as f:
-                    json.dump(metadata, f, ensure_ascii=False, indent=2)
-                self._atomic_replace(tmp_path, m_path)
-            except Exception as e:
-                logger.error(f"Failed to write metadata for {namespace}/{key}: {e}")
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-                raise
+            self._write_metadata_unlocked(m_path, metadata)
+
+    def update_metadata(
+        self,
+        namespace: str,
+        key: str,
+        mutator: Callable[[Dict[str, Any]], Dict[str, Any]],
+        dimensions: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """在「读-改-写全程持有同 key 文件锁」的前提下更新元数据，返回更新后的元数据。
+
+        用于并发落盘场景（如份额全市场扇出的多线程写入）：自己 read + write 会出现
+        「双方都读到旧值 → 各自合并 → 后写覆盖先写」而丢更新（覆盖区间回退）。
+        """
+        _, m_path = self.get_paths(namespace, key, dimensions)
+        with self._get_write_lock(m_path):
+            current = self._read_metadata_unlocked(m_path) or {}
+            updated = mutator(dict(current))
+            self._write_metadata_unlocked(m_path, updated)
+            return updated
 
     def read_records(
         self,

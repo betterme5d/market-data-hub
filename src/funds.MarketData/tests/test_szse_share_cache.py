@@ -95,3 +95,17 @@ async def test_szse_share_chunks_apply_polite_delay(tmp_path: Path):
     assert expected_chunks > 1
     assert mock_source.fetch_market_shares.call_count == expected_chunks
     assert mock_delay.call_count == expected_chunks - 1
+
+
+def test_update_fund_interval_uses_atomic_storage_primitive(tmp_path: Path):
+    """覆盖区间更新必须走 storage.update_metadata（读改写全程持锁），不能自己 read+write。"""
+    storage = ParquetStorageEngine(base_dir=tmp_path)
+    provider = FundShareProvider(storage=storage, szse_source=AsyncMock(spec=SzseShareSource))
+    dims = {"exchange": "szse"}
+
+    with patch.object(storage, "update_metadata", wraps=storage.update_metadata) as spy:
+        provider._update_fund_interval("159901", "2026-01-01", "2026-01-31", dims, "fund_share")
+
+    assert spy.call_count == 1
+    meta = storage.read_metadata("fund_share", "159901", dimensions=dims)
+    assert meta["intervals"] == [["2026-01-01", "2026-01-31"]]

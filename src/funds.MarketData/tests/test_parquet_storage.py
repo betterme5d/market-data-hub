@@ -155,3 +155,42 @@ def test_get_paths_accepts_normal_symbols_and_dimensions():
         )
         assert p_path.endswith(key + ".parquet")
         assert m_path.endswith(key + ".meta.json")
+
+
+def test_update_metadata_is_atomic_under_concurrency():
+    """并发读-改-写元数据不得丢更新：全程必须持有文件锁。"""
+    import threading
+    import time as _time
+
+    from core.timeseries_cache.tracker import IntervalTracker
+
+    engine = ParquetStorageEngine(base_dir=TEST_CACHE_DIR)
+    tracker = IntervalTracker()
+    dims = {"exchange": "szse"}
+
+    def make_mutator(interval):
+        def _mutate(meta):
+            _time.sleep(0.02)  # 放大竞态窗口：不持锁时两个线程都会读到空列表
+            meta["intervals"] = tracker.merge_intervals(meta.get("intervals", []), interval)
+            return meta
+
+        return _mutate
+
+    threads = [
+        threading.Thread(
+            target=engine.update_metadata,
+            args=("fund_share", "159901"),
+            kwargs={"mutator": make_mutator(iv), "dimensions": dims},
+        )
+        for iv in [("2026-01-01", "2026-01-31"), ("2026-03-01", "2026-03-31")]
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    meta = engine.read_metadata("fund_share", "159901", dimensions=dims)
+    assert meta["intervals"] == [
+        ["2026-01-01", "2026-01-31"],
+        ["2026-03-01", "2026-03-31"],
+    ]
