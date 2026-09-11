@@ -53,6 +53,9 @@ HEALTH_IDLE_SECONDS = _get_int("HEALTH_IDLE_SECONDS", 600)
 HEALTH_PROBE_INTERVAL = _get_int("HEALTH_PROBE_INTERVAL", 300)
 # 单次主动探测超时（秒）
 HEALTH_PROBE_TIMEOUT = _get_float("HEALTH_PROBE_TIMEOUT", 5.0)
+# K 线取数并发上限（雪球）：K 线此前完全脱离信号量/熔断治理，与行情共用同一上游
+XUEQIU_KLINE_CONCURRENCY = _get_int("XUEQIU_KLINE_CONCURRENCY", 3)
+
 # 每轮最多探测多少个源（错峰）：到期的源若一起探测，重型探针（全市场份额/列表）会并发打上游
 HEALTH_PROBE_MAX_PER_ROUND = _get_int("HEALTH_PROBE_MAX_PER_ROUND", 3)
 

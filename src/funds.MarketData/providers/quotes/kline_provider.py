@@ -158,15 +158,17 @@ class KLineProvider:
         生产环境中各 Source 类通过此处路由调用。
         """
         if source == "xueqiu":
-            from providers.quotes.xueqiu import XueqiuProvider
+            from providers.quotes.xueqiu import XueqiuProvider, kline_guard
+
             xq = XueqiuProvider(cache_manager=self.cache_manager)
-            return await xq._fetch_kline_slice(
-                symbol=standard_code,
-                slice_start=start_date,
-                slice_end=end_date,
-                period_str=period,
-                adjust_type=adjust,
-                on_chunk=on_chunk,
-            )
+            async with kline_guard():
+                return await xq._fetch_kline_slice(
+                    symbol=standard_code,
+                    slice_start=start_date,
+                    slice_end=end_date,
+                    period_str=period,
+                    adjust_type=adjust,
+                    on_chunk=on_chunk,
+                )
         # 未来扩展: tencent / sina source 实现插入此处
         raise NotImplementedError(f"Source {source!r} not yet implemented for kline fetching")

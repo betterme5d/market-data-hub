@@ -141,3 +141,47 @@ async def test_wide_merged_span_keeps_slices_separate(tmp):
     assert mock.call_count == 2
     slices = [(c.kwargs["start_date"], c.kwargs["end_date"]) for c in mock.call_args_list]
     assert slices == [("2001-01-01", "2012-12-31"), ("2014-01-01", "2024-12-31")]
+
+
+@pytest.mark.asyncio
+async def test_kline_fetch_short_circuits_when_source_blocked(tmp_path):
+    """雪球被熔断时 K 线必须短路（此前 K 线完全不受熔断约束）。"""
+    from unittest.mock import patch
+
+    from core.exceptions import BusinessException
+    from providers.quotes.kline_provider import KLineProvider
+
+    provider = KLineProvider(base_dir=tmp_path)
+    with patch(
+        "core.dispatcher.QuoteDispatcher.is_source_blocked", return_value=True
+    ), patch("providers.quotes.xueqiu.XueqiuProvider._fetch_kline_slice") as mock_fetch:
+        with pytest.raises(BusinessException):
+            await provider.get_kline(
+                "510300.SH", "2026-01-01", "2026-01-05", source="xueqiu"
+            )
+
+    assert mock_fetch.call_count == 0, "熔断后不得再打上游"
+
+
+@pytest.mark.asyncio
+async def test_kline_fetch_records_health_sample(tmp_path):
+    """K 线业务调用必须写入健康统计（此前缺失，导致该源 idle 判定失真）。"""
+    from unittest.mock import AsyncMock, patch
+
+    from providers.quotes import xueqiu as xq_mod
+    from providers.quotes.kline_provider import KLineProvider
+
+    async def fake_slice(*args, **kwargs):
+        return []
+
+    provider = KLineProvider(base_dir=tmp_path)
+    with patch.object(
+        xq_mod.XueqiuProvider, "_fetch_kline_slice", new_callable=AsyncMock, side_effect=fake_slice
+    ), patch("core.health.record_call") as mock_record:
+        await provider.get_kline(
+            "510300.SH", "2026-01-01", "2026-01-05", source="xueqiu"
+        )
+
+    assert mock_record.call_count >= 1
+    assert mock_record.call_args.args[0] == "xueqiu"
+    assert mock_record.call_args.args[1] is True

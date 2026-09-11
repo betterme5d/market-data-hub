@@ -1,4 +1,5 @@
 import asyncio
+import time
 import logging
 import os
 import random
@@ -6,6 +7,8 @@ from datetime import date, datetime, timedelta
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
+
+from contextlib import asynccontextmanager
 
 from core import cache as cache_store
 from core import config
@@ -89,6 +92,37 @@ class XueqiuKlineProbe(SourceProbe):
                 f"{self.name}: 最新 K 线为 {latest['date']}（距今 {age_days} 天），疑似接口停更"
             )
 
+
+# K 线取数治理闸门（D9）：K 线此前不走 QuoteDispatcher，既无信号量也无熔断，
+# 却与行情共用同一个上游域名 / Cookie。这里补上：熔断短路 + 并发上限 + 健康统计。
+_KLINE_SEMAPHORE = asyncio.Semaphore(config.XUEQIU_KLINE_CONCURRENCY)
+
+
+@asynccontextmanager
+async def kline_guard():
+    """雪球 K 线取数：熔断短路 + 并发闸门 + 健康记录。"""
+    # 局部导入：core.dispatcher 反过来 import 本模块，模块级导入会形成循环
+    from core import health
+    from core.dispatcher import QuoteDispatcher
+
+    if QuoteDispatcher.is_source_blocked("xueqiu"):
+        raise BusinessException(
+            "Xueqiu is circuit-broken; kline fetch skipped to protect upstream"
+        )
+
+    started = time.monotonic()
+    ok = False
+    try:
+        async with _KLINE_SEMAPHORE:
+            yield
+        ok = True
+    finally:
+        health.record_call(
+            "xueqiu",
+            ok,
+            (time.monotonic() - started) * 1000,
+            error=None if ok else "kline fetch failed",
+        )
 
 class XueqiuProvider(BaseProvider):
     def __init__(self, base_url: str = "https://stock.xueqiu.com/", 
@@ -541,14 +575,15 @@ class XueqiuProvider(BaseProvider):
         }
 
         async def fetch_fn(s_slice: str, e_slice: str, on_chunk=None):
-            return await self._fetch_kline_slice(
-                symbol=upper_symbol,
-                slice_start=s_slice,
-                slice_end=e_slice,
-                period_str=period_str,
-                adjust_type=adjust_type,
-                on_chunk=on_chunk
-            )
+            async with kline_guard():
+                return await self._fetch_kline_slice(
+                    symbol=upper_symbol,
+                    slice_start=s_slice,
+                    slice_end=e_slice,
+                    period_str=period_str,
+                    adjust_type=adjust_type,
+                    on_chunk=on_chunk,
+                )
 
         records = await self.cache_manager.get_or_fetch(
             namespace="kline",
