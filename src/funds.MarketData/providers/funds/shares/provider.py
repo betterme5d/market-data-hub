@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 class FundShareProvider:
     """统一基金份额服务门面（集成时序 Parquet 缓存、目标基金秒级响应与全市场并发扇出落盘）。"""
 
+    #: 小批量阈值：剩余基金 <= 该值时同步落盘（极小市场/单测），不走后台任务
+    SMALL_BATCH_THRESHOLD: int = 10
+    #: 默认后台扇出批次并发上限（背压）：在飞批次数、线程数与内存占用共同以此为上限
+    DEFAULT_MAX_CONCURRENT_FANOUTS: int = 3
+
     def __init__(
         self,
         storage: Optional[ParquetStorageEngine] = None,
@@ -29,12 +34,14 @@ class FundShareProvider:
         szse_source: Optional[SzseShareSource] = None,
         sse_source: Optional[SseShareSource] = None,
         max_workers: int = 16,
+        max_concurrent_fanouts: int = DEFAULT_MAX_CONCURRENT_FANOUTS,
     ):
         self.storage = storage or ParquetStorageEngine()
         self.tracker = tracker or IntervalTracker()
         self.szse_source = szse_source or SzseShareSource()
         self.sse_source = sse_source or SseShareSource()
-        self.max_workers = max_workers
+        self.max_workers = max(1, int(max_workers))
+        self.max_concurrent_fanouts = max(1, int(max_concurrent_fanouts))
 
         # 交易所级并发锁，防止同一交易所并发批量抓取造成的资源踩踏与重复请求
         self._exchange_locks: Dict[str, asyncio.Lock] = {}
@@ -44,13 +51,42 @@ class FundShareProvider:
         self._pending_tasks: Set[asyncio.Task] = set()
 
         # 内存缓冲：记录后台正在落盘中的批次数据 {(exchange, start_date, end_date): market_data}
+        # 键是**实际拉取的窗口区间**；查询时按"区间包含"匹配（见 _serve_from_in_memory_batch）
         self._in_memory_batches: Dict[Tuple[str, str, str], Dict[str, List[Dict[str, Any]]]] = {}
+
+        # 常驻落盘线程池（惰性创建）：杜绝"每个批次自建一个 ThreadPoolExecutor"的线程爆炸
+        self._fanout_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        # 全局扇出信号量（按事件循环惰性创建：模块级单例可能被多个事件循环使用）
+        self._fanout_semaphore: Optional[asyncio.Semaphore] = None
+        self._fanout_semaphore_loop: Optional[asyncio.AbstractEventLoop] = None
 
     async def _get_exchange_lock(self, exchange: str) -> asyncio.Lock:
         async with self._lock_guard:
             if exchange not in self._exchange_locks:
                 self._exchange_locks[exchange] = asyncio.Lock()
             return self._exchange_locks[exchange]
+
+    def _get_fanout_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        """常驻落盘线程池单例：所有后台批次共用，线程数上限 = max_workers。"""
+        if self._fanout_executor is None:
+            self._fanout_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.max_workers, thread_name_prefix="share-fanout"
+            )
+        return self._fanout_executor
+
+    def close(self) -> None:
+        """释放常驻落盘线程池（优雅退出/单测清理用）。"""
+        executor, self._fanout_executor = self._fanout_executor, None
+        if executor is not None:
+            executor.shutdown(wait=False)
+
+    def _get_fanout_semaphore(self) -> asyncio.Semaphore:
+        """当前事件循环上的扇出信号量：限制同时在飞的落盘批次数（背压）。"""
+        loop = asyncio.get_running_loop()
+        if self._fanout_semaphore is None or self._fanout_semaphore_loop is not loop:
+            self._fanout_semaphore = asyncio.Semaphore(self.max_concurrent_fanouts)
+            self._fanout_semaphore_loop = loop
+        return self._fanout_semaphore
 
     async def wait_pending_fanouts(self) -> None:
         """等待所有后台进行中的扇出落盘任务完成（主要用于单测与优雅退出）。"""
@@ -108,17 +144,17 @@ class FundShareProvider:
                 if force:
                     missing_slices = [(start_date, end_date)]
 
+                szse_fetched_any = False
                 for s_slice, e_slice in missing_slices:
-                    if resolved_exchange == "sse":
-                        # 检查是否有后台批次正在持有此数据
-                        batch_data = self._find_in_memory_batch(resolved_exchange, s_slice, e_slice)
-                        if batch_data is not None:
-                            await self._dispatch_fanout(
-                                batch_data, clean_code, s_slice, e_slice, dims, namespace
-                            )
-                        else:
+                    # 2.1 先看在飞批次（后台正在落盘的全市场数据）：命中的部分直接即时落盘，
+                    # 缺口随之收缩，只剩未覆盖的部分需要回源——同一缺口不会被并发请求重复拉全市场。
+                    remaining_slices = self._serve_from_in_memory_batch(
+                        clean_code, s_slice, e_slice, dims, namespace
+                    )
+                    for r_start, r_end in remaining_slices:
+                        if resolved_exchange == "sse":
                             logger.info(
-                                f"Fetching SSE market fund shares for [{s_slice} ~ {e_slice}] (triggered by {clean_code})"
+                                f"Fetching SSE market fund shares for [{r_start} ~ {r_end}] (triggered by {clean_code})"
                             )
                             # 沪市是逐交易日拉全市场（每交易日 2.5~4 秒），必须边拉边落盘：
                             # 否则一次客户端断开（C# 侧超时）就让整段的逐日工作全部作废。
@@ -132,33 +168,27 @@ class FundShareProvider:
                                 self._dispatch_fanout_sync(window, clean_code, w_start, w_end, dims, namespace)
 
                             market_data = await self.sse_source.fetch_market_shares_range(
-                                s_slice, e_slice, on_window=_on_window,
+                                r_start, r_end, on_window=_on_window,
                                 incomplete_days_out=incomplete_days,
                             )
                             if not flushed and market_data:
                                 # 回调一次都没触发（旧实现/测试桩）：退回"整段一次"落盘与标记
                                 self._dispatch_fanout_sync(
-                                    market_data, clean_code, s_slice, e_slice, dims, namespace
+                                    market_data, clean_code, r_start, r_end, dims, namespace
                                 )
-                    else:
-                        # 深交所：按 <=60 天分片拉取
-                        chunks = split_date_range(s_slice, e_slice, max_days=60)
-                        for chunk_idx, (chunk_s, chunk_e) in enumerate(chunks):
-                            batch_data = self._find_in_memory_batch(resolved_exchange, chunk_s, chunk_e)
-                            if batch_data is not None:
-                                await self._dispatch_fanout(
-                                    batch_data, clean_code, chunk_s, chunk_e, dims, namespace
+                        else:
+                            # 深交所：按 <=60 天分片拉取
+                            for chunk_s, chunk_e in split_date_range(r_start, r_end, max_days=60):
+                                # 片内同样先消化在飞批次，只对未覆盖的部分回源
+                                remaining_in_chunk = self._serve_from_in_memory_batch(
+                                    clean_code, chunk_s, chunk_e, dims, namespace
                                 )
-                            else:
-                                if chunk_idx > 0:
-                                    await polite_delay()  # 60 天切片之间的礼貌延时（0.2~0.5s）
-                                logger.info(
-                                    f"Fetching SZSE market fund shares for chunk [{chunk_s} ~ {chunk_e}] (triggered by {clean_code})"
-                                )
-                                market_data = await self.szse_source.fetch_market_shares(chunk_s, chunk_e)
-                                await self._dispatch_fanout(
-                                    market_data, clean_code, chunk_s, chunk_e, dims, namespace
-                                )
+                                for c_start, c_end in remaining_in_chunk:
+                                    await self._fetch_szse_chunk(
+                                        c_start, c_end, clean_code, dims, namespace,
+                                        apply_delay=szse_fetched_any,
+                                    )
+                                    szse_fetched_any = True
 
         # 3. 从 Parquet 读取精准区间数据
         records = self.storage.read_records(
@@ -174,11 +204,69 @@ class FundShareProvider:
         records.sort(key=lambda r: str(r.get("share_date", "")))
         return [FundShare(**r) for r in records]
 
-    def _find_in_memory_batch(
-        self, exchange: str, chunk_s: str, chunk_e: str
-    ) -> Optional[Dict[str, List[Dict[str, Any]]]]:
-        """检查是否有正在后台落盘的批次覆盖当前所需区间。"""
-        return self._in_memory_batches.get((exchange, chunk_s, chunk_e))
+    async def _fetch_szse_chunk(
+        self,
+        chunk_s: str,
+        chunk_e: str,
+        target_code: str,
+        dims: Dict[str, str],
+        namespace: str,
+        apply_delay: bool = False,
+    ) -> None:
+        """拉取深市一个 <=60 天切片并扇出落盘。
+
+        背压：先占一个扇出槽位再回源，槽位由后台批次在落盘完成后释放。
+        否则多片回补时会瞬间把所有切片的全市场数据都堆在内存里（每片可达数 MB）。
+        """
+        if apply_delay:
+            await polite_delay()  # 60 天切片之间的礼貌延时（0.2~0.5s）
+
+        logger.info(
+            f"Fetching SZSE market fund shares for chunk [{chunk_s} ~ {chunk_e}] (triggered by {target_code})"
+        )
+        semaphore = self._get_fanout_semaphore()
+        await semaphore.acquire()
+        try:
+            market_data = await self.szse_source.fetch_market_shares(chunk_s, chunk_e)
+        except BaseException:
+            semaphore.release()
+            raise
+        self._dispatch_fanout_sync(
+            market_data, target_code, chunk_s, chunk_e, dims, namespace,
+            acquired_semaphore=semaphore,
+        )
+
+    def _serve_from_in_memory_batch(
+        self, fund_code: str, start: str, end: str, dims: Dict[str, str], namespace: str
+    ) -> List[Tuple[str, str]]:
+        """用"在飞批次"（后台正在落盘的全市场数据）即时满足目标基金。
+
+        在飞批次的键是**实际拉取的窗口区间**，与请求缺口边界通常不一致，
+        因此这里按"批次区间包含于请求区间"匹配（旧实现拿缺口边界做等值查询，
+        键口径不一致导致永远查不中，同一缺口被并发请求重复拉全市场）。
+
+        命中部分立即写入元数据（数据已在内存，无需回源），
+        返回值为**仍未覆盖**的剩余缺口；没有任何命中时返回 [(start, end)]。
+        """
+        hits: List[Tuple[Tuple[str, str, str], Dict[str, List[Dict[str, Any]]]]] = []
+        for key, market_data in self._in_memory_batches.items():
+            if key[0] != dims.get("exchange", ""):
+                continue
+            # ISO 日期串可直接按字典序比较（等价于时间先后）
+            if key[1] >= start and key[2] <= end:
+                hits.append((key, market_data))
+
+        if not hits:
+            return [(start, end)]
+
+        hits.sort(key=lambda item: (item[0][1], item[0][2]))
+        for key, market_data in hits:
+            self._persist_single_fund(
+                fund_code, market_data.get(fund_code, []), key[1], key[2], dims, namespace
+            )
+
+        meta = self.storage.read_metadata(namespace, fund_code, dimensions=dims) or {}
+        return self.tracker.find_missing_slices(meta.get("intervals", []), start, end)
 
     async def _dispatch_fanout(
         self,
@@ -189,7 +277,7 @@ class FundShareProvider:
         dims: Dict[str, str],
         namespace: str,
     ) -> None:
-        """异步入口，语义同 _dispatch_fanout_sync。"""
+        """异步入口，语义同 _dispatch_fanout_sync（不开槽位，由后台任务自行获取）。"""
         self._dispatch_fanout_sync(market_data, target_code, chunk_s, chunk_e, dims, namespace)
 
     def _dispatch_fanout_sync(
@@ -200,52 +288,104 @@ class FundShareProvider:
         chunk_e: str,
         dims: Dict[str, str],
         namespace: str,
+        acquired_semaphore: Optional[asyncio.Semaphore] = None,
     ) -> None:
         """
         分发扇出落盘：
         1. 目标基金（target_code）优先在主线程极速持久化并更新元数据（~5ms），确保立刻对当前请求可用；
-        2. 剩余基金：若是小规模（<=10只，如测试），直接线程池同步完成；
-           若是真实全市场（几百只），放入后台异步任务（线程池并发），彻底不阻塞主事件循环与当前响应。
+        2. 剩余基金：若是小规模（<= SMALL_BATCH_THRESHOLD 只，如测试），直接线程池同步完成；
+           若是真实全市场（几百只），放入后台异步任务（常驻线程池并发），彻底不阻塞主事件循环与当前响应。
 
         本方法为**同步**实现：除 create_task 外不 await，因此也能在"请求已被取消"的
         回调路径（沪市逐交易日增量落盘）里安全调用——那种场景下任何 await 都会立刻再抛 CancelledError。
+
+        :param acquired_semaphore: 调用方已预先占用的扇出槽位（深市分片路径为背压而预占）。
+            非 None 时槽位所有权移交本方法：任一早退分支用 finally 释放，
+            进入后台批次时移交给批次任务，在批次落盘完成后释放。
         """
-        # 0. 空市场防线（Empty Market Guard）：
-        # 若上游接口异常或格式解析失败导致全市场数据为空，严禁写入覆盖区间，彻底杜绝缓存毒化
-        if not market_data:
-            logger.warning(
-                f"Empty market data received for [{chunk_s} ~ {chunk_e}] ({dims}). Skipping interval update to prevent cache poisoning."
-            )
-            return
+        slot = acquired_semaphore
+        try:
+            # 0. 空市场防线（Empty Market Guard）：
+            # 若上游接口异常或格式解析失败导致全市场数据为空，严禁写入覆盖区间，彻底杜绝缓存毒化
+            if not market_data:
+                logger.warning(
+                    f"Empty market data received for [{chunk_s} ~ {chunk_e}] ({dims}). Skipping interval update to prevent cache poisoning."
+                )
+                return
 
-        # 1. 优先持久化目标基金
-        target_records = market_data.get(target_code, [])
-        self._persist_single_fund(target_code, target_records, chunk_s, chunk_e, dims, namespace)
+            # 1. 优先持久化目标基金
+            target_records = market_data.get(target_code, [])
+            self._persist_single_fund(target_code, target_records, chunk_s, chunk_e, dims, namespace)
 
-        # 2. 分离剩余基金
-        remaining_items = [(k, v) for k, v in market_data.items() if k != target_code]
-        if not remaining_items:
-            return
+            # 2. 分离剩余基金
+            remaining_items = [(k, v) for k, v in market_data.items() if k != target_code]
+            if not remaining_items:
+                return
 
-        if len(remaining_items) <= 10:
-            # 小批量（如单元测试）：直接线程池同步完成，确保后续断言直接命中
-            self._persist_funds_batch(
-                remaining_items, chunk_s, chunk_e, dims, namespace, max_workers=self.max_workers
-            )
-        else:
+            if len(remaining_items) <= self.SMALL_BATCH_THRESHOLD:
+                # 小批量（如单元测试）：直接线程池同步完成，确保后续断言直接命中
+                self._persist_funds_batch(
+                    remaining_items, chunk_s, chunk_e, dims, namespace, max_workers=self.max_workers
+                )
+                return
+
             # 大批量全市场（如 800+ 只基金）：
-            # 暂存内存缓冲字典供瞬时并发查询直接使用
+            # 暂存内存缓冲字典供瞬时并发查询直接使用（键 = 实际拉取窗口区间）
             batch_key = (dims.get("exchange", ""), chunk_s, chunk_e)
             self._in_memory_batches[batch_key] = market_data
 
             # 提交后台异步落盘任务，多线程并发写，并在完成时清理内存缓冲
-            task = asyncio.create_task(
-                self._persist_fanout_chunk_async(
-                    remaining_items, chunk_s, chunk_e, dims, namespace, batch_key
+            try:
+                task = asyncio.create_task(
+                    self._persist_fanout_chunk_async(
+                        remaining_items, chunk_s, chunk_e, dims, namespace, batch_key, slot
+                    )
                 )
-            )
+            except BaseException:
+                self._in_memory_batches.pop(batch_key, None)
+                raise
+            # 槽位所有权已移交后台任务（它在 finally 里释放），此处不再由本方法释放
+            slot = None
             self._pending_tasks.add(task)
             task.add_done_callback(self._pending_tasks.discard)
+        finally:
+            if slot is not None:
+                slot.release()
+
+    async def _persist_items(
+        self,
+        items: List[Tuple[str, List[Dict[str, Any]]]],
+        chunk_s: str,
+        chunk_e: str,
+        dims: Dict[str, str],
+        namespace: str,
+    ) -> None:
+        """把一批基金提交到常驻线程池落盘（并发上限 = max_workers，不再每批自建线程池）。"""
+        if not items:
+            return
+        loop = asyncio.get_running_loop()
+        executor = self._get_fanout_executor()
+        await asyncio.gather(*(
+            loop.run_in_executor(
+                executor, self._persist_fund_guarded, code, records, chunk_s, chunk_e, dims, namespace
+            )
+            for code, records in items
+        ))
+
+    def _persist_fund_guarded(
+        self,
+        fund_code: str,
+        records: List[Dict[str, Any]],
+        chunk_s: str,
+        chunk_e: str,
+        dims: Dict[str, str],
+        namespace: str,
+    ) -> None:
+        """单只基金落盘（异常不冒泡：一只失败不影响整批）。"""
+        try:
+            self._persist_single_fund(fund_code, records, chunk_s, chunk_e, dims, namespace)
+        except Exception as err:
+            logger.error(f"Failed to persist fanout fund {fund_code}: {err}")
 
     async def _persist_fanout_chunk_async(
         self,
@@ -255,21 +395,28 @@ class FundShareProvider:
         dims: Dict[str, str],
         namespace: str,
         batch_key: Tuple[str, str, str],
+        acquired_semaphore: Optional[asyncio.Semaphore] = None,
     ) -> None:
-        """后台异步任务：在独立线程池中并发落盘剩余基金，避免阻塞主事件循环。"""
+        """后台异步任务：在常驻线程池中并发落盘剩余基金，避免阻塞主事件循环。
+
+        背压：未预先持有槽位时，先排队等一个扇出槽位再开写——在飞批次数、
+        线程数与常驻内存（每个批次一份全市场数据）都因此有明确上限。
+        """
+        acquired = False
+        semaphore: Optional[asyncio.Semaphore] = None
         try:
-            await asyncio.to_thread(
-                self._persist_funds_batch,
-                items,
-                chunk_s,
-                chunk_e,
-                dims,
-                namespace,
-                self.max_workers,
-            )
+            if acquired_semaphore is not None:
+                semaphore, acquired = acquired_semaphore, True
+            else:
+                semaphore = self._get_fanout_semaphore()
+                await semaphore.acquire()
+                acquired = True
+            await self._persist_items(items, chunk_s, chunk_e, dims, namespace)
         except Exception as e:
             logger.error(f"Background fan-out persistence error for {batch_key}: {e}")
         finally:
+            if acquired and semaphore is not None:
+                semaphore.release()
             self._in_memory_batches.pop(batch_key, None)
 
     def _persist_funds_batch(
@@ -281,7 +428,7 @@ class FundShareProvider:
         namespace: str,
         max_workers: int = 16,
     ) -> None:
-        """使用线程池并发落盘多只基金。"""
+        """使用线程池并发落盘多只基金（仅用于小批量同步路径）。"""
         if not items:
             return
 
@@ -358,4 +505,3 @@ class FundShareProvider:
 
 # 全局单例
 fund_share_provider = FundShareProvider()
-
