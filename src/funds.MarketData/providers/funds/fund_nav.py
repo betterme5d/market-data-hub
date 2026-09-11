@@ -47,6 +47,7 @@ class FundNavProvider:
         start_date: str,
         end_date: str,
         source: Optional[str] = "eastmoney",
+        force: bool = False,
     ) -> List[FundNav]:
         """
         获取单只基金在 [start_date, end_date] 闭区间内的历史净值（带持久增量缓存）。
@@ -89,6 +90,7 @@ class FundNavProvider:
             fetch_fn=_fetch_slice,
             date_column="nav_date",
             dimensions={"source": src_name},
+            force=force,
         )
 
         return [

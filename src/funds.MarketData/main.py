@@ -25,7 +25,7 @@ from providers.exchanges.szse import (
     SzseWwwProbe,
 )
 from providers.funds.cmtidp import CmtidpProbe
-from providers.funds.eastmoney import EastmoneyJjjzProbe, EastmoneyProbe
+from providers.funds.eastmoney import EastmoneyProbe
 from providers.funds.establish_dates import EastmoneyEstablishDateProbe
 from providers.funds.fund_profile import EastmoneyProfileProbe
 from providers.exchanges.shares.sse import SseShareProbe
@@ -99,7 +99,7 @@ if config.DEBUG:
 def _register_probes() -> None:
     """向健康体系注册各数据源的主动探针。"""
     probes = (
-        CfetsProbe(), CmtidpProbe(), EastmoneyProbe(), EastmoneyJjjzProbe(),
+        CfetsProbe(), CmtidpProbe(), EastmoneyProbe(),
         EastmoneyEstablishDateProbe(), EastmoneyProfileProbe(),
         SzseWwwProbe(), SzseFundProbe(), SzseDocsProbe(), SzseDiscProbe(),
         SseQueryProbe(), SseYunhqProbe(), SseWwwProbe(),

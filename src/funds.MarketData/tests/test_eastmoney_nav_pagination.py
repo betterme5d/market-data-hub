@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import asyncio
+from contextlib import ExitStack
 from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
@@ -162,3 +163,234 @@ async def test_fetch_lsjz_page_retry_succeeds():
         assert data["ErrCode"] == "0"
         assert client_instance.get.call_count == 2
         assert mock_sleep.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# 场内最新净值：东财「场内交易基金排行 dt=fb」+「开放基金排行 dt=kf」两榜合并
+#   页面：https://fund.eastmoney.com/data/fbsfundranking.html (fb)
+#         https://fund.eastmoney.com/data/fundranking.html  (kf)
+#   行格式（逗号分隔字符串）：[0]代码 [1]简称 [2]拼音 [3]净值日期 [4]单位净值 [5]累计净值
+#   依据：dt=fb 只覆盖白名单 1631/2067（ETF 全在 fb），LOF（161725/160105…）只在 kf。
+# ---------------------------------------------------------------------------
+
+WHITELIST = {"510300", "159915", "161725"}
+LATEST_TRADING_DAY = "2026-09-11"
+
+
+@pytest.fixture(autouse=True)
+def _stub_trading_day():
+    """固定「最近一个交易日」，避免测试打真实深交所日历。"""
+    with patch(
+        "providers.funds.eastmoney._calendar.latest_trading_day",
+        new_callable=AsyncMock,
+        return_value=LATEST_TRADING_DAY,
+    ):
+        yield
+
+
+def _rank_row(code: str, nav_date: str, unit: str, accum: str) -> str:
+    """构造 rankhandler datas 里的一行（逗号拼接）。"""
+    return ",".join([code, code + "基金", "PY", nav_date, unit, accum, "-1.23"])
+
+
+def _rank_page(rows, all_records=None, all_pages=1):
+    return {
+        "rows": rows,
+        "all_records": len(rows) if all_records is None else all_records,
+        "all_pages": all_pages,
+    }
+
+
+def _fetch_by_dt(by_dt):
+    """按 dt 分派的假分页函数：by_dt = {"fb": [第1页, 第2页...], "kf": [...]}，缺省为空榜。"""
+
+    async def _fetch(dt, page_index, page_size):
+        pages = by_dt.get(dt) or []
+        if page_index - 1 < len(pages):
+            return pages[page_index - 1]
+        return _rank_page([])
+
+    return _fetch
+
+
+def _patch_rank(by_dt):
+    """统一 patch：交易所白名单 + 分页拉取。"""
+    return [
+        patch("providers.funds.eastmoney.get_exchange_listed_codes", new_callable=AsyncMock, return_value=WHITELIST),
+        patch.object(EastmoneySource, "_fetch_rank_page", side_effect=_fetch_by_dt(by_dt)),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_latest_all_nav_merges_fb_and_kf_and_filters_non_exchange_listed():
+    """两榜合并：fb 取 ETF，kf 取 LOF；不在白名单的场外基金被过滤。"""
+    source = EastmoneySource()
+    by_dt = {
+        "fb": [_rank_page([
+            _rank_row("510300", "2026-09-11", "4.5794", "2.0252"),
+            _rank_row("000001", "2026-09-11", "9.9", "9.9"),
+        ])],
+        "kf": [_rank_page([_rank_row("161725", "2026-09-11", "0.5337", "2.2498")])],
+    }
+    with ExitStack() as stack:
+        for patcher in _patch_rank(by_dt):
+            stack.enter_context(patcher)
+        items = await source.get_latest_all_nav()
+
+    got = {it.code: (it.nav_date, it.unit_nav, it.accum_nav) for it in items}
+    assert got == {
+        "510300": ("2026-09-11", 4.5794, 2.0252),
+        "161725": ("2026-09-11", 0.5337, 2.2498),
+    }
+
+
+@pytest.mark.asyncio
+async def test_latest_all_nav_paginates_each_list():
+    """allPages=2 时必须翻到第 2 页，不能只取首页。"""
+    source = EastmoneySource()
+    by_dt = {
+        "fb": [
+            _rank_page(
+                [_rank_row("510300", "2026-09-11", "1.0", "1.0"), _rank_row("159915", "2026-09-11", "2.0", "2.0")],
+                all_records=3,
+                all_pages=2,
+            ),
+            _rank_page([_rank_row("159919", "2026-09-11", "3.0", "3.0")], all_records=3, all_pages=2),
+        ],
+    }
+    with ExitStack() as stack:
+        for patcher in _patch_rank(by_dt):
+            stack.enter_context(patcher)
+        items = await source.get_latest_all_nav()
+
+    assert sorted(it.code for it in items) == ["159915", "510300"]
+
+
+@pytest.mark.asyncio
+async def test_latest_all_nav_raises_on_page_failure():
+    """任一榜单第 2 页失败必须抛错，禁止把第 1 页当全量返回。"""
+    source = EastmoneySource()
+    by_dt = {
+        "fb": [
+            _rank_page([_rank_row("510300", "2026-09-11", "1.0", "1.0")], all_records=2, all_pages=2),
+            None,
+        ],
+    }
+    with ExitStack() as stack:
+        for patcher in _patch_rank(by_dt):
+            stack.enter_context(patcher)
+        with pytest.raises(RuntimeError, match="dt=fb"):
+            await source.get_latest_all_nav()
+
+
+@pytest.mark.asyncio
+async def test_latest_all_nav_raises_when_rows_short_of_all_records():
+    """实际行数少于上游自述 allRecords → 抛错，不返回半份。"""
+    source = EastmoneySource()
+    by_dt = {
+        "fb": [_rank_page([_rank_row("510300", "2026-09-11", "1.0", "1.0")], all_records=10, all_pages=1)],
+    }
+    with ExitStack() as stack:
+        for patcher in _patch_rank(by_dt):
+            stack.enter_context(patcher)
+        with pytest.raises(RuntimeError, match="incomplete"):
+            await source.get_latest_all_nav()
+
+
+@pytest.mark.asyncio
+async def test_latest_all_nav_fixes_cross_year_date():
+    """元旦后上游年份未回退：净值日期晚于最近交易日 → 年份减 1。"""
+    source = EastmoneySource()
+    by_dt = {"fb": [_rank_page([_rank_row("510300", "2027-12-31", "1.236", "1.236")])]}
+    with ExitStack() as stack:
+        for patcher in _patch_rank(by_dt):
+            stack.enter_context(patcher)
+        stack.enter_context(
+            patch(
+                "providers.funds.eastmoney._calendar.latest_trading_day",
+                new_callable=AsyncMock,
+                return_value="2027-01-05",
+            )
+        )
+        items = await source.get_latest_all_nav()
+
+    assert [(it.code, it.nav_date) for it in items] == [("510300", "2026-12-31")]
+
+
+@pytest.mark.asyncio
+async def test_latest_all_nav_keeps_normal_date_unchanged():
+    """正常日期（<= 最近交易日）不得被改动。"""
+    source = EastmoneySource()
+    by_dt = {"fb": [_rank_page([_rank_row("510300", "2026-09-11", "1.5", "2.5")])]}
+    with ExitStack() as stack:
+        for patcher in _patch_rank(by_dt):
+            stack.enter_context(patcher)
+        items = await source.get_latest_all_nav()
+
+    assert [(it.code, it.nav_date, it.unit_nav, it.accum_nav) for it in items] == [
+        ("510300", "2026-09-11", 1.5, 2.5)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_latest_all_nav_keeps_previous_year_date():
+    """元旦后：上游已正确给出上一年 12-31，不得被改动。"""
+    source = EastmoneySource()
+    by_dt = {"fb": [_rank_page([_rank_row("510300", "2025-12-31", "1.0", "1.0")])]}
+    with ExitStack() as stack:
+        for patcher in _patch_rank(by_dt):
+            stack.enter_context(patcher)
+        stack.enter_context(
+            patch(
+                "providers.funds.eastmoney._calendar.latest_trading_day",
+                new_callable=AsyncMock,
+                return_value="2026-01-05",
+            )
+        )
+        items = await source.get_latest_all_nav()
+
+    assert [(it.code, it.nav_date) for it in items] == [("510300", "2025-12-31")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_latest_all_nav_skips_row_with_empty_date():
+    """上游存在日期为空的记录（dt=kf 实测 33 行）：无法定日期，必须跳过而不是硬塞。"""
+    source = EastmoneySource()
+    by_dt = {
+        "fb": [_rank_page([
+            _rank_row("510300", "2026-09-11", "1.0", "1.0"),
+            _rank_row("159915", "", "2.0", "2.0"),
+        ])],
+    }
+    with ExitStack() as stack:
+        for patcher in _patch_rank(by_dt):
+            stack.enter_context(patcher)
+        items = await source.get_latest_all_nav()
+
+    assert [(it.code, it.nav_date) for it in items] == [("510300", "2026-09-11")]
+
+
+@pytest.mark.asyncio
+async def test_latest_all_nav_applies_polite_delay_between_pages():
+    """两榜翻页（allPages=2）之间必须有礼貌延时。"""
+    source = EastmoneySource()
+    by_dt = {
+        "fb": [
+            _rank_page(
+                [_rank_row("510300", "2026-09-11", "1.0", "1.0")],
+                all_records=2,
+                all_pages=2,
+            ),
+            _rank_page([_rank_row("159915", "2026-09-11", "2.0", "2.0")], all_records=2, all_pages=2),
+        ],
+    }
+    with ExitStack() as stack:
+        for patcher in _patch_rank(by_dt):
+            stack.enter_context(patcher)
+        delay = stack.enter_context(
+            patch("providers.funds.eastmoney.polite_delay", new_callable=AsyncMock)
+        )
+        await source.get_latest_all_nav()
+
+    assert delay.call_count >= 2, "翻页 + 换榜单 都要延时"

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from core.models import FundShare
+from core.pacing import polite_delay
 from core.timeseries_cache.storage import ParquetStorageEngine
 from core.timeseries_cache.tracker import IntervalTracker
 from providers.exchanges.shares.sse import SSE_ETF_EARLIEST_DATE, SseShareSource
@@ -63,6 +64,7 @@ class FundShareProvider:
         end_date: str,
         exchange: Optional[str] = None,
         incomplete_days: Optional[List[str]] = None,
+        force: bool = False,
     ) -> List[FundShare]:
         """
         获取指定基金在 [start_date, end_date] 区间的历史份额数据。
@@ -91,6 +93,9 @@ class FundShareProvider:
                 intervals = meta.get("intervals", [])
 
         missing_slices = self.tracker.find_missing_slices(intervals, start_date, end_date)
+        if force:
+            # force=True（方案A）：忽略已覆盖区间，强制重取整个请求范围
+            missing_slices = [(start_date, end_date)]
 
         # 2. 若存在缺失切片，在交易所锁保护下拉取并全市场扇出落盘
         if missing_slices:
@@ -100,6 +105,8 @@ class FundShareProvider:
                 meta = self.storage.read_metadata(namespace, clean_code, dimensions=dims) or {}
                 intervals = meta.get("intervals", [])
                 missing_slices = self.tracker.find_missing_slices(intervals, start_date, end_date)
+                if force:
+                    missing_slices = [(start_date, end_date)]
 
                 for s_slice, e_slice in missing_slices:
                     if resolved_exchange == "sse":
@@ -136,13 +143,15 @@ class FundShareProvider:
                     else:
                         # 深交所：按 <=60 天分片拉取
                         chunks = split_date_range(s_slice, e_slice, max_days=60)
-                        for chunk_s, chunk_e in chunks:
+                        for chunk_idx, (chunk_s, chunk_e) in enumerate(chunks):
                             batch_data = self._find_in_memory_batch(resolved_exchange, chunk_s, chunk_e)
                             if batch_data is not None:
                                 await self._dispatch_fanout(
                                     batch_data, clean_code, chunk_s, chunk_e, dims, namespace
                                 )
                             else:
+                                if chunk_idx > 0:
+                                    await polite_delay()  # 60 天切片之间的礼貌延时（0.2~0.5s）
                                 logger.info(
                                     f"Fetching SZSE market fund shares for chunk [{chunk_s} ~ {chunk_e}] (triggered by {clean_code})"
                                 )

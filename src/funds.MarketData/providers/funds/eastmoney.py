@@ -15,6 +15,9 @@ from core.models import FundNav
 from core.timeseries_cache.crawler import PageBatch, PaginatedSliceCrawler
 from providers.base import SourceProbe
 from providers.funds.base_nav import FundNavProvider
+from core.filters import get_exchange_listed_codes, is_target_exchange_fund
+from core.pacing import polite_delay
+from providers.exchanges.szse import SzseCalendarSource
 
 # 禁用未验证的 HTTPS 请求警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -28,8 +31,86 @@ _UA = (
 
 # lsjz 单基金历史净值单页上限（反爬限制，实测 pageSize 恒被上游封顶为 20）
 _LSJZ_PAGE_SIZE = 20
-# Fund_JJJZ_Data.aspx 全量最新净值单页上限（实测 20000）
-_JJJZ_PAGE_SIZE = 20000
+# 深交所官方交易日历：用于校验并修正东财净值日期（净值日期不可能晚于最近一个交易日）
+_calendar = SzseCalendarSource()
+
+# 东财基金排行（场内最新净值的来源）。
+#
+# 页面引用：
+#   - 场内交易基金排行（ETF/封闭）：https://fund.eastmoney.com/data/fbsfundranking.html  → dt=fb
+#   - 开放基金排行（含 LOF）：      https://fund.eastmoney.com/data/fundranking.html   → dt=kf
+# 底层接口：https://fund.eastmoney.com/data/rankhandler.aspx?op=ph&dt={fb|kf}&ft=all&...
+#
+# 为什么必须两个榜单合并（2026-09-11 实测，与交易所上市白名单比对）：
+#   - dt=fb：allRecords=1648，覆盖白名单 1631/2067；ETF（510300/588000/159915…）全在此榜；
+#   - dt=kf：allRecords=24459，覆盖白名单 403/2067；LOF 多在此榜（161725/160105/163407/501050…）；
+#   - 只用 dt=fb 会漏掉约 403 只 LOF；两榜合并覆盖 2034/2067，其余 33 只两榜都没有。
+#
+# 注意：Fund_JJJZ_Data.aspx 是"开放式基金（场外）"列表，实测六种参数组合均不含 510300/159915，
+#       不能用于场内净值，故本项目不再使用它。
+#
+# 两榜净值列位一致（逗号分隔字符串）：
+#   [0]=基金代码 [1]=基金简称 [2]=拼音 [3]=净值日期 [4]=单位净值 [5]=累计净值 [6]=日增长率
+_EM_RANK_URL = "https://fund.eastmoney.com/data/rankhandler.aspx"
+_EM_RANK_DTS = ("fb", "kf")
+# 单页条数实测：pn>=5000 时上游一次全量返回（无条数上限），
+# 故取 20000 —— 两榜合计仅 3 次请求（fb 1 次 + kf 2 次），而 pn=500 需 53 次。
+_EM_RANK_PAGE_SIZE = 20000
+_EM_RANK_COL_DATE = 3
+_EM_RANK_COL_UNIT_NAV = 4
+_EM_RANK_COL_ACCUM_NAV = 5
+_EM_RANK_REFERER = {
+    "fb": "https://fund.eastmoney.com/data/fbsfundranking.html",
+    "kf": "https://fund.eastmoney.com/data/fundranking.html",
+}
+
+
+def _extract_json_array(text: str, name: str) -> Optional[list]:
+    """按括号配对从 JS 对象字面量里截取 name:[...] 并 json 解析（rankhandler 返回非严格 JSON）。"""
+    key_idx = text.find(name + ":")
+    if key_idx < 0:
+        return None
+    start = text.find("[", key_idx)
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start : i + 1])
+                except json.JSONDecodeError as e:
+                    logger.error(f"extract array {name} json decode failed: {e}")
+                    return None
+    return None
+
+
+def _extract_scalar_int(text: str, name: str) -> Optional[int]:
+    """截取 name:123 或 name:"123" 形式的上游标量并转 int。"""
+    m = re.search(name + ':\\s*"?(\\d+)"?', text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
 
 
 class EastmoneyProbe(SourceProbe):
@@ -45,27 +126,6 @@ class EastmoneyProbe(SourceProbe):
             raise RuntimeError("eastmoney probe: lsjz abnormal response")
         if not (data.get("Data") or {}).get("LSJZList"):
             raise RuntimeError("eastmoney probe: lsjz returned empty list")
-
-
-class EastmoneyJjjzProbe(SourceProbe):
-    """天天基金 Fund_JJJZ_Data（全量最新净值）接口的健康探针。
-
-    与 lsjz 是同一个源（eastmoney）下的两个不同上游接口——外部 API 的参数/
-    验证/返回结构随时可能单独变化，1 个上游接口对应 1 个探针，缺一即静默失效。
-    """
-
-    name = "eastmoney-jjjz"
-    category = "funds"
-
-    async def probe(self) -> None:
-        """对 Fund_JJJZ_Data 发起一次最轻量请求（1 页 1 条），校验解析结构。"""
-        data = await EastmoneySource()._fetch_jjjz_page(1, 1)
-        if data is None:
-            raise RuntimeError("eastmoney-jjjz probe: request failed")
-        if not data.get("datas"):
-            raise RuntimeError("eastmoney-jjjz probe: empty datas")
-        if not data.get("showday"):
-            raise RuntimeError("eastmoney-jjjz probe: empty showday")
 
 
 class EastmoneySource(FundNavProvider):
@@ -585,133 +645,181 @@ class EastmoneySource(FundNavProvider):
             on_page=on_page,
         )
 
-    async def _fetch_jjjz_page(
-        self, page_index: int, page_size: int
+    @staticmethod
+    def _normalize_nav_date(day: str, latest_trading_day: str) -> str:
+        """把上游净值日期规范为 YYYY-MM-DD，并处理跨年。
+
+        实证（2026-09-11 全量扫描）：rankhandler 的日期列一律是完整的 YYYY-MM-DD
+        （dt=fb 1648/1648、dt=kf 24427/24427 非空行，0 行格式异常），因此只需处理"年份未回退"：
+          1) 年份未回退：2026-01-05 抓到 2026-12-31，实际应为 2025-12-31；
+
+        规则：净值日期一定 <= 最近一个交易日。
+          - 带年份且 > 最近交易日 → 年份减 1；
+          - 带年份且 <= 最近交易日 → 原样返回；
+          - 格式完全无法识别 → 打 WARN 并原样返回（不猜测）。
+        """
+        if not day:
+            return day
+        text = day.strip()
+        if not latest_trading_day:
+            return text
+
+        # 1) 完整日期 YYYY-MM-DD
+        full = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", text)
+        if full:
+            year = int(full.group(1))
+            month, day_of_month = full.group(2), full.group(3)
+            candidate = f"{year:04d}-{month}-{day_of_month}"
+            if candidate <= latest_trading_day:
+                return candidate
+            fixed = f"{year - 1:04d}-{month}-{day_of_month}"
+            logger.warning(
+                f"eastmoney rank 净值日期 {candidate} 晚于最近交易日 {latest_trading_day}，按跨年修正为 {fixed}"
+            )
+            return fixed
+
+
+        logger.warning(f"eastmoney rank 非预期净值日期格式: {text!r}，保持原值")
+        return text
+
+
+    async def get_latest_all_nav(self) -> List[FundNav]:
+        """获取全市场场内 ETF/LOF 的最新净值（东财场内 + 开放两个榜单合并）。
+
+        页面引用：
+        - 场内交易基金排行（ETF/封闭）：https://fund.eastmoney.com/data/fbsfundranking.html
+        - 开放基金排行（含 LOF）：      https://fund.eastmoney.com/data/fundranking.html
+        底层接口：https://fund.eastmoney.com/data/rankhandler.aspx?op=ph&dt={fb|kf}&...
+
+        为什么必须两榜合并（2026-09-11 实测，与交易所上市白名单比对）：
+        - 只用 dt=fb 覆盖 1631/2067，**漏掉约 403 只 LOF**（161725/160105/163407 只在 kf）；
+        - 两榜的净值列位一致：[3]=净值日期 [4]=单位净值 [5]=累计净值；
+        - 两榜合并覆盖 2034/2067；按代码去重（同码以先出现的榜单为准）。
+
+        完整性契约：任一榜单任一分页请求失败、或累计行数少于上游自述 allRecords，
+        一律抛错而不返回半份数据。
+        日期契约：净值日期不可能晚于「最近一个交易日」，晚了按跨年处理（年份减 1）。
+        """
+        listed_codes = await get_exchange_listed_codes()
+        latest_trading_day = await _calendar.latest_trading_day() or ""
+
+        items: List[FundNav] = []
+        seen_codes: set = set()
+
+        for dt in _EM_RANK_DTS:
+            if dt != _EM_RANK_DTS[0]:
+                await polite_delay()  # 换榜单之间的礼貌延时
+            page_index = 1
+            all_pages: Optional[int] = None
+            all_records: Optional[int] = None
+            raw_rows = 0
+
+            while True:
+                if page_index > 1:
+                    await polite_delay()  # 翻页礼貌延时（0.2~0.5s）
+                data = await self._fetch_rank_page(dt, page_index, _EM_RANK_PAGE_SIZE)
+                if data is None:
+                    raise RuntimeError(
+                        f"eastmoney rank(dt={dt}) page {page_index} fetch failed; "
+                        f"全量最新净值不完整，拒绝返回半份数据"
+                    )
+
+                if all_pages is None:
+                    all_pages = data.get("all_pages") or 1
+                    all_records = data.get("all_records") or 0
+
+                rows = data.get("rows") or []
+                raw_rows += len(rows)
+                for item in rows:
+                    if not isinstance(item, str):
+                        continue
+                    fields = item.split(",")
+                    if len(fields) <= _EM_RANK_COL_ACCUM_NAV:
+                        continue
+                    code = fields[0].strip()
+                    if (
+                        not code
+                        or code in seen_codes
+                        or not is_target_exchange_fund(code, listed_codes)
+                    ):
+                        continue
+                    unit_nav = self._to_nav_float(fields[_EM_RANK_COL_UNIT_NAV])
+                    accum_nav = self._to_nav_float(fields[_EM_RANK_COL_ACCUM_NAV])
+                    if unit_nav is None and accum_nav is None:
+                        continue
+                    nav_date = self._normalize_nav_date(
+                        fields[_EM_RANK_COL_DATE].strip(), latest_trading_day
+                    )
+                    if not nav_date:
+                        continue
+                    items.append(
+                        FundNav(
+                            code=code,
+                            nav_date=nav_date,
+                            unit_nav=unit_nav,
+                            accum_nav=accum_nav,
+                        )
+                    )
+                    seen_codes.add(code)
+
+                if not rows:
+                    break
+                if all_pages and page_index >= all_pages:
+                    break
+                page_index += 1
+
+            # 上游自述 allRecords 与实际累计行数比对：不足即视为截断
+            if all_records and raw_rows < all_records:
+                raise RuntimeError(
+                    f"eastmoney rank(dt={dt}) incomplete: got {raw_rows} rows, "
+                    f"allRecords={all_records}; 拒绝返回半份数据"
+                )
+
+        return items
+
+    async def _fetch_rank_page(
+        self, dt: str, page_index: int, page_size: int
     ) -> Optional[Dict[str, Any]]:
-        """请求全量最新净值 Fund_JJJZ_Data.aspx 一页，解析 `var db={...}` JS。"""
-        url = f"{config.EASTMONEY_FUND_BASE_URL}/Data/Fund_JJJZ_Data.aspx"
+        """请求东财基金排行一页，返回 {rows, all_records, all_pages}；失败返回 None。
+
+        dt=fb：场内交易基金排行 https://fund.eastmoney.com/data/fbsfundranking.html
+        dt=kf：开放基金排行     https://fund.eastmoney.com/data/fundranking.html
+        行格式：逗号分隔字符串，[0]=代码 [3]=净值日期 [4]=单位净值 [5]=累计净值。
+        """
         params = {
-            "t": "1",
-            "lx": "1",
-            "sort": "rzdf,desc",
-            "page": f"{page_index},{page_size}",
-            "onlySale": "0",
-            "isLatest": "0",
+            "op": "ph",
+            "dt": dt,
+            "ft": "all",
+            "rs": "",
+            "gs": "0",
+            "sc": "1nzf",
+            "st": "desc",
+            "pi": str(page_index),
+            "pn": str(page_size),
+            "v": "0.1234567890",
         }
         headers = {
             "User-Agent": _UA,
-            "Referer": "https://fund.eastmoney.com/fund.html",
+            "Referer": _EM_RANK_REFERER.get(dt, _EM_RANK_REFERER["kf"]),
         }
         try:
-            async with httpx.AsyncClient(
-                timeout=config.UPSTREAM_TIMEOUT, verify=False
-            ) as client:
-                resp = await client.get(url, params=params, headers=headers)
+            async with httpx.AsyncClient(timeout=config.UPSTREAM_TIMEOUT, verify=False) as client:
+                resp = await client.get(_EM_RANK_URL, params=params, headers=headers)
                 resp.raise_for_status()
                 text = resp.text
         except Exception as e:
-            logger.error(f"Fetch JJJZ failed page {page_index}: {e}")
+            logger.error(f"Fetch eastmoney rank(dt={dt}) page {page_index} failed: {e}")
             return None
 
-        # 返回形如 var db={chars:["0",...],datas:[["...","..."],...],pages:"2",...};
-        # 是 JS 对象字面量（外层 key 为裸标识符，数组值为双引号字符串），不能直接 json.loads。
-        # datas 数组内可能嵌套空数组 []，不能用简单正则，改用括号配对扫描精确截取。
-        def _extract_array(name: str) -> Optional[str]:
-            key_idx = text.find(name + ":")
-            if key_idx < 0:
-                return None
-            start = text.find("[", key_idx)
-            if start < 0:
-                return None
-            depth = 0
-            in_str = False
-            esc = False
-            for i in range(start, len(text)):
-                ch = text[i]
-                if in_str:
-                    if esc:
-                        esc = False
-                    elif ch == "\\":
-                        esc = True
-                    elif ch == '"':
-                        in_str = False
-                    continue
-                if ch == '"':
-                    in_str = True
-                elif ch == "[":
-                    depth += 1
-                elif ch == "]":
-                    depth -= 1
-                    if depth == 0:
-                        return text[start : i + 1]
+        rows = _extract_json_array(text, "datas")
+        if rows is None:
+            logger.error(f"eastmoney rank(dt={dt}) page {page_index}: datas array not found")
             return None
-
-        try:
-            datas_raw = _extract_array("datas")
-            showday_raw = _extract_array("showday")
-            # pages 是字符串如 "2"（非数组），单独用正则取
-            pages_match = re.search(r"\bpages\s*:\s*\"([^\"]*)\"", text)
-            pages_val = pages_match.group(1) if pages_match else "1"
-            return {
-                "datas": json.loads(datas_raw) if datas_raw else [],
-                "showday": json.loads(showday_raw) if showday_raw else [],
-                "pages": pages_val,
-            }
-        except (json.JSONDecodeError, TypeError) as e:
-            logger.error(f"JJJZ parse failed page {page_index}: {e}")
-            return None
-
-    async def get_latest_all_nav(self) -> List[FundNav]:
-        """
-        获取最新一期所有基金净值（全量）。内部循环分页（pageSize 20000，实测 2 页）。
-        净值日期来自顶层 showday[0]（最新日）。
-        """
-        items: List[FundNav] = []
-        page_index = 1
-        total_pages: Optional[int] = None
-
-        while True:
-            data = await self._fetch_jjjz_page(page_index, _JJJZ_PAGE_SIZE)
-            if data is None:
-                break
-
-            showday = data.get("showday") or []
-            latest_date = showday[0] if showday else ""
-
-            if total_pages is None:
-                try:
-                    total_pages = int(data.get("pages", "1"))
-                except (TypeError, ValueError):
-                    total_pages = 1
-
-            datas = data.get("datas") or []
-            for row in datas:
-                if not isinstance(row, (list, tuple)) or len(row) < 5:
-                    continue
-                code = row[0]
-                if not code or not latest_date:
-                    continue
-                unit_nav = self._to_nav_float(row[3])
-                accum_nav = self._to_nav_float(row[4])
-                # 跳过无净值数据的基金（第 3/4 列均为空）
-                if unit_nav is None and accum_nav is None:
-                    continue
-                items.append(
-                    FundNav(
-                        code=code,
-                        nav_date=latest_date,
-                        unit_nav=unit_nav,
-                        accum_nav=accum_nav,
-                    )
-                )
-
-            if not datas:
-                break
-            if total_pages and page_index >= total_pages:
-                break
-            page_index += 1
-
-        return items
+        return {
+            "rows": rows,
+            "all_records": _extract_scalar_int(text, "allRecords"),
+            "all_pages": _extract_scalar_int(text, "allPages"),
+        }
 
     # ------------------------------------------------------------------
     # 健康探针已上移到 EastmoneyProbe（见文件头部）

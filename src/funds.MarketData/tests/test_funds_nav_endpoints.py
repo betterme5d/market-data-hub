@@ -55,7 +55,9 @@ def test_navs_source_resolutions(mock_get_nav):
     resp1 = client.get("/api/v1/funds/510300/navs?start_date=2024-01-01&end_date=2024-01-10&source=cmtidp")
     assert resp1.status_code == 200
     assert resp1.json()["source"] == "cmtidp"
-    mock_get_nav.assert_called_with("510300", start_date="2024-01-01", end_date="2024-01-10", source="cmtidp")
+    mock_get_nav.assert_called_with(
+        "510300", start_date="2024-01-01", end_date="2024-01-10", source="cmtidp", force=False
+    )
 
     # 2. 大小写容错 Query 参数 Source=cmtidp
     resp2 = client.get("/api/v1/funds/510300/navs?start_date=2024-01-01&end_date=2024-01-10&Source=cmtidp")
@@ -90,3 +92,19 @@ def test_legacy_history_success(mock_get_nav):
     data = resp.json()
     assert data["count"] == 1
     assert data["items"][0]["code"] == "510300"
+
+
+@patch("routers.funds.fund_nav_provider.get_fund_nav_history", new_callable=AsyncMock)
+def test_navs_refresh_passthrough(mock_get_nav):
+    """refresh=true → force=True 透传到 Provider；缺省为 False。"""
+    mock_get_nav.return_value = []
+
+    resp = client.get(
+        "/api/v1/funds/510300/navs?start_date=2024-01-01&end_date=2024-01-10&refresh=true"
+    )
+    assert resp.status_code == 200
+    assert mock_get_nav.call_args.kwargs["force"] is True
+
+    mock_get_nav.reset_mock()
+    client.get("/api/v1/funds/510300/navs?start_date=2024-01-01&end_date=2024-01-10")
+    assert mock_get_nav.call_args.kwargs["force"] is False

@@ -168,13 +168,16 @@ class QuoteDispatcher:
             logger.warning(f"Reset failures for {source} failed: {e}")
 
     @staticmethod
-    async def get_quote_with_fallback(symbol: str, allowed_sources: Dict[str, str], with_depth: bool = False) -> UnifiedQuote:
+    async def get_quote_with_fallback(
+        symbol: str, allowed_sources: Dict[str, str], with_depth: bool = False, refresh: bool = False
+    ) -> UnifiedQuote:
         """
         单只行情智能 Fallback 抓取，支持可选的五档深度数据
         """
         # 1. 尝试读 Valkey 缓存 (仅在不带深度数据时使用缓存)
         cache_key = get_quote_cache_key(symbol)
-        if not with_depth and redis_client:
+        # refresh=True（方案A）：跳过缓存读取，但结果仍会回写
+        if not with_depth and not refresh and redis_client:
             try:
                 cached = redis_client.get(cache_key)
                 if cached:
@@ -237,7 +240,9 @@ class QuoteDispatcher:
         raise Exception(err_msg)
 
     @staticmethod
-    async def get_quotes_batch(items: List[Dict[str, Any]], with_depth: bool = False) -> List[UnifiedQuote]:
+    async def get_quotes_batch(
+        items: List[Dict[str, Any]], with_depth: bool = False, refresh: bool = False
+    ) -> List[UnifiedQuote]:
         """
         批量行情高并发、自适应合并打包 Fallback 调度，支持可选的五档深度数据
         """
@@ -246,8 +251,8 @@ class QuoteDispatcher:
 
         results_map: Dict[str, UnifiedQuote] = {}
         
-        # 1. 批量批量读 Valkey 缓存 (仅在不带深度数据时使用缓存)
-        if not with_depth and redis_client:
+        # 1. 批量批量读 Valkey 缓存 (仅在不带深度数据时使用缓存；refresh=True 时跳过)
+        if not with_depth and not refresh and redis_client:
             try:
                 cache_keys = [get_quote_cache_key(item["symbol"]) for item in items]
                 cached_values = redis_client.mget(cache_keys)

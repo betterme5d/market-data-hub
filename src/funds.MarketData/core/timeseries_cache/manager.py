@@ -89,6 +89,7 @@ class TimeSeriesCacheManager:
         date_column: str = "date",
         dimensions: Optional[Dict[str, str]] = None,
         coalesce: Optional[Callable[[str, str], bool]] = None,
+        force: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         核心读取/增量抓取方法：
@@ -111,13 +112,22 @@ class TimeSeriesCacheManager:
 
             raw_missing = self.tracker.find_missing_slices(intervals, start_date, end_date)
 
+            # force=True（方案A）：忽略已覆盖区间，强制重取整个请求范围（结果仍会回写并合并区间）
+            if force:
+                raw_missing = [(start_date, end_date)]
+
             today_str = date.today().strftime("%Y-%m-%d")
             yesterday_str = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
 
             # 过滤掉近期已探测过但未发布的今日切片
             effective_missing = []
             for s_slice, e_slice in raw_missing:
-                if s_slice == today_str and e_slice == today_str and self._is_today_pending(lock_key):
+                if (
+                    not force
+                    and s_slice == today_str
+                    and e_slice == today_str
+                    and self._is_today_pending(lock_key)
+                ):
                     logger.debug(f"{lock_key} today is pending within TTL, skipping fetch for today")
                     continue
                 effective_missing.append((s_slice, e_slice))

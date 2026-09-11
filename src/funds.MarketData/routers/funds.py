@@ -249,6 +249,9 @@ async def get_fund_navs(
     start_date: str = Query(..., description="起始日期 (YYYY-MM-DD)，必填"),
     end_date: str = Query(..., description="结束日期 (YYYY-MM-DD)，必填"),
     source: str | None = Query(None, description="数据源：eastmoney (默认) | cmtidp"),
+    refresh: bool = Query(
+        False, description="true 时忽略已有缓存区间，强制重取上游并回写缓存（方案A）"
+    ),
     header_source: str | None = Header(None, alias="source", description="Header 透传数据源"),
     x_source: str | None = Header(None, alias="x-source", description="Header 透传数据源 (X-Source)"),
     request: Request = None,
@@ -282,7 +285,7 @@ async def get_fund_navs(
 
     try:
         items = await fund_nav_provider.get_fund_nav_history(
-            clean_code, start_date=s_date, end_date=e_date, source=resolved_source
+            clean_code, start_date=s_date, end_date=e_date, source=resolved_source, force=refresh
         )
         return FundNavResponse(source=resolved_source, count=len(items), items=items)
     except ValueError as ve:
@@ -347,6 +350,9 @@ async def get_fund_shares(
     code: str = Path(..., description="基金代码（深市以 1 开头的 6 位代码）"),
     start_date: str = Query(..., description="起始日期 (YYYY-MM-DD)"),
     end_date: str = Query(..., description="结束日期 (YYYY-MM-DD)"),
+    refresh: bool = Query(
+        False, description="true 时忽略已有缓存区间，强制重取全市场并回写缓存（方案A，代价高）"
+    ),
 ):
     """
     获取深市指定基金在 [start_date, end_date] 区间的逐日历史份额列表。
@@ -376,7 +382,12 @@ async def get_fund_shares(
     try:
         incomplete: List[str] = []
         items = await fund_share_provider.get_fund_shares(
-            clean_code, s_date, e_date, exchange=resolved_exchange, incomplete_days=incomplete
+            clean_code,
+            s_date,
+            e_date,
+            exchange=resolved_exchange,
+            incomplete_days=incomplete,
+            force=refresh,
         )
         return FundShareResponse(
             code=clean_code, exchange=resolved_exchange, count=len(items), items=items,

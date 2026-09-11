@@ -28,14 +28,20 @@ class BatchQuoteRequest(BaseModel):
 
 
 @router.post("/quote/batch", response_model=List[UnifiedQuoteOut], tags=["行情数据"], summary="批量获取实时行情")
-async def get_quotes_batch(request: BatchQuoteRequest, with_depth: bool = Query(False, description="是否包含五档深度盘口数据")):
+async def get_quotes_batch(
+    request: BatchQuoteRequest,
+    with_depth: bool = Query(False, description="是否包含五档深度盘口数据"),
+    refresh: bool = Query(False, description="true 时跳过缓存读取，强制打上游并回写缓存（方案A）"),
+):
     """
     批量获取多个证券的最新实时报价。
     C#端通过此接口发送包含每个标的可用源映射的字典。
     """
     try:
         items_dict = [{"symbol": item.symbol, "allowed_sources": item.allowed_sources} for item in request.items]
-        results = await QuoteDispatcher.get_quotes_batch(items_dict, with_depth=with_depth)
+        results = await QuoteDispatcher.get_quotes_batch(
+            items_dict, with_depth=with_depth, refresh=refresh
+        )
         return results
     except Exception as e:
         logger.error(f"Batch quote fetch failed: {e}")
@@ -46,7 +52,8 @@ async def get_quotes_batch(request: BatchQuoteRequest, with_depth: bool = Query(
 async def get_quote(
     symbol: str = Path(..., description="标的代码，例如 AAPL 或 000001.SZ"),
     source: Optional[str] = Query(None, description="强制行情提供商（如 tencent, sina, xueqiu, yfinance），不填则自动多源 Fallback"),
-    with_depth: bool = Query(False, description="是否包含五档深度盘口数据")
+    with_depth: bool = Query(False, description="是否包含五档深度盘口数据"),
+    refresh: bool = Query(False, description="true 时跳过缓存读取，强制打上游并回写缓存（方案A）"),
 ):
     """
     获取单个股票或 ETF 的最新实时报价，支持自动代码翻译与多源自适应熔断 Fallback。
@@ -62,7 +69,9 @@ async def get_quote(
         allowed_sources = translate_standard_symbol(symbol)
 
     try:
-        result = await QuoteDispatcher.get_quote_with_fallback(symbol, allowed_sources, with_depth=with_depth)
+        result = await QuoteDispatcher.get_quote_with_fallback(
+            symbol, allowed_sources, with_depth=with_depth, refresh=refresh
+        )
         return result
     except BusinessException as be:
         raise HTTPException(status_code=400, detail=str(be))

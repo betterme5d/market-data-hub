@@ -411,3 +411,32 @@ async def test_without_coalesce_keeps_per_slice_fetch():
     )
 
     assert requested == [("2026-04-01", "2026-04-30"), ("2026-07-01", "2026-08-31")]
+
+
+@pytest.mark.asyncio
+async def test_force_refetch_ignores_covered_intervals(tmp_path):
+    """force=True 忽略已覆盖区间强制重取；force=False 命中覆盖则不重取。"""
+    from core.timeseries_cache.manager import TimeSeriesCacheManager
+    from core.timeseries_cache.storage import ParquetStorageEngine
+
+    mgr = TimeSeriesCacheManager(storage=ParquetStorageEngine(base_dir=tmp_path))
+    calls = []
+
+    async def fetch(s_date, e_date):
+        calls.append((s_date, e_date))
+        return [
+            {"date": "2024-01-02", "v": 1.0},
+            {"date": "2024-01-03", "v": 2.0},
+        ]
+
+    await mgr.get_or_fetch("t_ns", "K", "2024-01-02", "2024-01-03", fetch, date_column="date")
+    assert len(calls) == 1
+
+    await mgr.get_or_fetch("t_ns", "K", "2024-01-02", "2024-01-03", fetch, date_column="date")
+    assert len(calls) == 1, "已覆盖区间不应重取"
+
+    await mgr.get_or_fetch(
+        "t_ns", "K", "2024-01-02", "2024-01-03", fetch, date_column="date", force=True
+    )
+    assert len(calls) == 2, "force=True 必须重取"
+    assert calls[-1] == ("2024-01-02", "2024-01-03")

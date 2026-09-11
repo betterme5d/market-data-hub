@@ -4,7 +4,7 @@
 """
 import logging
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 from typing import List, Optional, Tuple
 
 import httpx
@@ -21,6 +21,19 @@ _UA = (
 
 # 深交所官方交易日历接口：month=YYYY-MM 返回该月完整日历，jybz=1 表示交易日。
 SZSE_CALENDAR_URL = "https://www.szse.cn/api/report/exchange/onepersistenthour/monthList"
+
+
+def _parse_publish_cutoff(value: str) -> dtime:
+    """把配置的 "HH:MM" 解析为时间；非法值回退 15:30。"""
+    try:
+        hour, minute = str(value).strip().split(":")
+        return dtime(int(hour), int(minute))
+    except Exception:
+        return dtime(15, 30)
+
+
+# 当日净值披露截止时点：该时点之前，交易日当日的净值视为尚未披露
+_NAV_PUBLISH_CUTOFF = _parse_publish_cutoff(config.NAV_PUBLISH_CUTOFF)
 
 
 async def _reachability(url: str, verify: bool = True) -> None:
@@ -112,6 +125,7 @@ class SzseCalendarSource:
         self.base_url = (base_url or SZSE_CALENDAR_URL).rstrip("/")
         self._cache_day: Optional[str] = None
         self._cache_latest: Optional[str] = None
+        self._cache_days = {}  # (as_of, count, published_only) -> 最近 count 个交易日(新→旧)
 
     async def get_month_days(self, month: str) -> List[Tuple[str, bool]]:
         """获取某月（YYYY-MM）完整日历，返回 [(jyrq, is_trading), ...]，按日期升序。"""
@@ -125,10 +139,38 @@ class SzseCalendarSource:
         days.sort(key=lambda x: x[0])
         return days
 
-    async def latest_trading_day(self, as_of: Optional[str] = None) -> Optional[str]:
-        """返回 <= as_of（默认今天）的最近一个交易日；同一天内命中缓存，不重复请求上游。"""
-        today = (date.fromisoformat(as_of) if as_of else date.today())
-        cache_key = today.isoformat()
+    @staticmethod
+    def _reference_day(
+        as_of: Optional[str], now: Optional[datetime], published_only: bool
+    ) -> date:
+        """计算查询参考日。
+
+        published_only=True（已发布口径）：若当前时刻早于 _NAV_PUBLISH_CUTOFF（默认 15:30），
+        则交易日当日的净值视为尚未披露，参考日回退一天（周末/节假日自然落到上一个交易日）。
+        published_only=False（纯日历口径）：直接取今天。
+        """
+        if as_of:
+            return date.fromisoformat(as_of)
+        current = now or datetime.now()
+        if published_only and current.time() < _NAV_PUBLISH_CUTOFF:
+            return current.date() - timedelta(days=1)
+        return current.date()
+
+
+    async def latest_trading_day(
+        self,
+        as_of: Optional[str] = None,
+        now: Optional[datetime] = None,
+        published_only: bool = False,
+    ) -> Optional[str]:
+        """返回 <= 参考日 的最近一个交易日；同一天内命中缓存，不重复请求上游。
+
+        published_only=False（默认，纯日历口径）：东财的跨年不变式必须用这个——
+        若这里也用 15:30 口径，会把当日已发布的净值日期误判成跨年（年份减 1）。
+        published_only=True：用于「已发布」语义（如 CMTIDP 的最近交易日窗口）。
+        """
+        today = self._reference_day(as_of, now, published_only)
+        cache_key = f"{today.isoformat()}|pub={published_only}"
         if self._cache_day == cache_key and self._cache_latest is not None:
             return self._cache_latest
 
@@ -151,6 +193,53 @@ class SzseCalendarSource:
 
         self._cache_day = cache_key
         self._cache_latest = result
+        return result
+
+
+    async def latest_trading_days(
+        self,
+        count: int = 3,
+        as_of: Optional[str] = None,
+        now: Optional[datetime] = None,
+        published_only: bool = False,
+    ) -> List[str]:
+        """返回 <= 参考日 的最近 count 个交易日，按「由新到旧」排序。
+
+        与 latest_trading_day 共用 monthList 接口并按日期缓存；跨月最多回溯 6 个月。
+        published_only=True 时按「已发布」口径（15:30 前当日净值未披露，参考日回退一天）。
+        只有确实取够 count 个交易日才写缓存——避免上游抖动把短结果固化。
+        """
+        if count <= 0:
+            return []
+        today = self._reference_day(as_of, now, published_only)
+        day_str = today.isoformat()
+        cache_key = (day_str, count, published_only)
+        cached = self._cache_days.get(cache_key)
+        if cached is not None:
+            return list(cached)
+
+        collected: List[str] = []
+        seen_months = set()
+        for offset in range(6):
+            month_first = today.replace(day=1) - timedelta(days=offset * 28)
+            month = month_first.strftime("%Y-%m")
+            if month in seen_months:
+                continue
+            seen_months.add(month)
+            try:
+                days = await self.get_month_days(month)
+            except Exception as e:
+                logger.error(f"szse calendar fetch failed for {month}: {e}")
+                continue
+            for jyrq, is_trading in reversed(days):
+                if is_trading and jyrq <= day_str:
+                    collected.append(jyrq)
+            if len(collected) >= count:
+                break
+
+        result = collected[:count]
+        if len(result) >= count:
+            self._cache_days[cache_key] = result
         return result
 
 

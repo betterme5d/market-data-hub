@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from pathlib import Path
 from core.timeseries_cache.storage import ParquetStorageEngine
 from core.timeseries_cache.tracker import IntervalTracker
@@ -45,3 +45,53 @@ async def test_fund_share_provider_fanout(tmp_path: Path):
 
     meta2 = storage.read_metadata("fund_share", "159915", dimensions={"exchange": "szse"})
     assert [tuple(x) for x in meta2["intervals"]] == [("2026-06-01", "2026-06-30")]
+
+
+@pytest.mark.asyncio
+async def test_share_provider_force_refetch_even_when_covered(tmp_path: Path):
+    """force=True 时即使区间已覆盖也必须重取；force=False 命中覆盖则不重取。"""
+    storage = ParquetStorageEngine(base_dir=tmp_path)
+    dims = {"exchange": "szse"}
+    storage.write_metadata(
+        "fund_share",
+        "159901",
+        {
+            "key": "159901",
+            "namespace": "fund_share",
+            "dimensions": dims,
+            "intervals": [["2026-06-01", "2026-06-30"]],
+            "date_column": "share_date",
+        },
+        dimensions=dims,
+    )
+    mock_source = AsyncMock(spec=SzseShareSource)
+    mock_source.fetch_market_shares.return_value = {}
+    provider = FundShareProvider(storage=storage, szse_source=mock_source)
+
+    await provider.get_fund_shares("159901", "2026-06-01", "2026-06-30", exchange="szse")
+    assert mock_source.fetch_market_shares.call_count == 0, "已覆盖且未 force → 不应重取"
+
+    await provider.get_fund_shares(
+        "159901", "2026-06-01", "2026-06-30", exchange="szse", force=True
+    )
+    assert mock_source.fetch_market_shares.call_count == 1, "force=True → 必须重取"
+
+
+@pytest.mark.asyncio
+async def test_szse_share_chunks_apply_polite_delay(tmp_path: Path):
+    """>60 天区间会被切成多片，片间必须有礼貌延时（片数-1 次）。"""
+    from providers.exchanges.shares.szse import split_date_range
+    from providers.funds.shares import provider as share_provider_mod
+
+    storage = ParquetStorageEngine(base_dir=tmp_path)
+    mock_source = AsyncMock(spec=SzseShareSource)
+    mock_source.fetch_market_shares.return_value = {}
+    provider = FundShareProvider(storage=storage, szse_source=mock_source)
+
+    with patch.object(share_provider_mod, "polite_delay", new_callable=AsyncMock) as mock_delay:
+        await provider.get_fund_shares("159901", "2026-01-01", "2026-06-30", exchange="szse")
+
+    expected_chunks = len(split_date_range("2026-01-01", "2026-06-30", max_days=60))
+    assert expected_chunks > 1
+    assert mock_source.fetch_market_shares.call_count == expected_chunks
+    assert mock_delay.call_count == expected_chunks - 1

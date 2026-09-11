@@ -45,3 +45,19 @@ def test_get_fund_shares_sse_success(mock_get_shares):
     assert body["exchange"] == "sse"
     assert body["count"] == 1
     assert body["items"][0]["shares"] == 28000.0
+
+
+@patch("providers.funds.shares.provider.FundShareProvider.get_fund_shares")
+def test_shares_refresh_passthrough(mock_get_shares):
+    """refresh=true → force=True 透传到 FundShareProvider；缺省为 False。"""
+    mock_get_shares.return_value = []
+
+    resp = client.get(
+        "/api/v1/funds/159901/shares?start_date=2026-06-01&end_date=2026-06-30&refresh=true"
+    )
+    assert resp.status_code == 200
+    assert mock_get_shares.call_args.kwargs["force"] is True
+
+    mock_get_shares.reset_mock()
+    client.get("/api/v1/funds/159901/shares?start_date=2026-06-01&end_date=2026-06-30")
+    assert mock_get_shares.call_args.kwargs["force"] is False

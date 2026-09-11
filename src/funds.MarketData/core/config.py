@@ -57,6 +57,16 @@ HEALTH_PROBE_TIMEOUT = _get_float("HEALTH_PROBE_TIMEOUT", 5.0)
 # ---------- 透传请求的默认超时（秒） ----------
 UPSTREAM_TIMEOUT = _get_float("UPSTREAM_TIMEOUT", 30.0)
 
+# ---------- 通用礼貌延时（分页/切片之间）----------
+# 分页或切片类上游请求之间的随机抖动休眠（秒）：避免密集请求被上游限频
+UPSTREAM_PAGE_MIN_DELAY = _get_float("UPSTREAM_PAGE_MIN_DELAY", 0.2)
+UPSTREAM_PAGE_MAX_DELAY = _get_float("UPSTREAM_PAGE_MAX_DELAY", 0.5)
+
+# ---------- 净值「已发布」口径 ----------
+# 最近已发布交易日的截止时点（HH:MM）：交易日该时点前，当日净值视为尚未披露。
+# 对齐 C# FundNetValueCollectionJob 的 15:00 口径，本项目按业务要求取 15:30。
+NAV_PUBLISH_CUTOFF = _get("NAV_PUBLISH_CUTOFF", "15:30")
+
 # ---------- 基金份额数据源参数 ----------
 SSE_SHARE_MIN_DELAY = _get_float("SSE_SHARE_MIN_DELAY", 0.5)
 SSE_SHARE_MAX_DELAY = _get_float("SSE_SHARE_MAX_DELAY", 3.0)
