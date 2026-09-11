@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 #（跨命名空间写文件 = 缓存投毒），因此统一在存储层做最后一道拦截。
 _SAFE_PATH_TOKEN = re.compile(r"^[A-Za-z0-9_.\-]+$")
 
+# 元数据 schema 版本：meta.json 结构发生不兼容变更时递增。
+# 读到"更高版本"的文件按不可解读处理（宁可重取，也不能按旧语义猜错覆盖区间）。
+METADATA_SCHEMA_VERSION = 1
+
 
 def _ensure_safe_path_token(kind: str, value) -> str:
     """校验缓存路径片段；含分隔符、上跳或非法字符一律抛 ValueError。"""
@@ -106,15 +110,31 @@ class ParquetStorageEngine:
 
     @staticmethod
     def _read_metadata_unlocked(m_path: str) -> Optional[Dict[str, Any]]:
-        """读取元数据文件（不加锁；并发控制由调用方负责）。"""
+        """读取元数据文件（不加锁；并发控制由调用方负责）。
+
+        schema 版本策略：
+        - 无 schema_version：存量文件，按 v0 兼容读取；
+        - 版本 > METADATA_SCHEMA_VERSION：本代码读不懂新结构，返回 None（调用方视为无元数据，
+          会重新向上游取数）。绝不允许"猜着读"，否则可能把错误的覆盖区间当成事实、永久固化缺口。
+        """
         if not os.path.exists(m_path):
             return None
         try:
             with open(m_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                meta = json.load(f)
         except Exception as e:
             logger.warning(f"Failed to read metadata {m_path}: {e}")
             return None
+
+        if isinstance(meta, dict):
+            version = meta.get("schema_version")
+            if isinstance(version, int) and version > METADATA_SCHEMA_VERSION:
+                logger.warning(
+                    f"Metadata {m_path} has schema_version={version} > supported "
+                    f"{METADATA_SCHEMA_VERSION}; ignoring it (will refetch from upstream)"
+                )
+                return None
+        return meta
 
     def read_metadata(
         self,
@@ -127,7 +147,13 @@ class ParquetStorageEngine:
         return self._read_metadata_unlocked(m_path)
 
     def _write_metadata_unlocked(self, m_path: str, metadata: Dict[str, Any]) -> None:
-        """原子写入元数据文件（不加锁；并发控制由调用方负责）。"""
+        """原子写入元数据文件（不加锁；并发控制由调用方负责）。
+
+        统一在这里盖 schema 版本号：write_metadata 与 update_metadata 都经过本函数，
+        写入路径不必各自记得带版本。
+        """
+        metadata = dict(metadata)
+        metadata.setdefault("schema_version", METADATA_SCHEMA_VERSION)
         os.makedirs(os.path.dirname(m_path), exist_ok=True)
         tmp_path = f"{m_path}.tmp.{uuid.uuid4().hex}"
         try:

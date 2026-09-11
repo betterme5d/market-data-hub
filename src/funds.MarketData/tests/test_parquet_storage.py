@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
+import json
 import os
 import shutil
 import tempfile
 import pytest
-from core.timeseries_cache.storage import ParquetStorageEngine
+from core.timeseries_cache.storage import METADATA_SCHEMA_VERSION, ParquetStorageEngine
 
 # 测试产物落在系统临时目录：仓库目录被 dev 容器挂载并 watch，
 # 在源码树内反复建/删目录会让 uvicorn 的 StatReload 看门狗 rglob 撞上已消失的目录而崩溃
@@ -194,3 +195,52 @@ def test_update_metadata_is_atomic_under_concurrency():
         ["2026-01-01", "2026-01-31"],
         ["2026-03-01", "2026-03-31"],
     ]
+
+def test_metadata_carries_schema_version():
+    """D25：元数据必须带 schema 版本，且旧文件（无版本）仍按 v0 兼容读取。"""
+    engine = ParquetStorageEngine(base_dir=TEST_CACHE_DIR)
+    dims = {"source": "eastmoney"}
+
+    engine.write_metadata("fund_nav", "510300", {"key": "510300", "intervals": []}, dimensions=dims)
+    meta = engine.read_metadata("fund_nav", "510300", dimensions=dims)
+    assert meta["schema_version"] == METADATA_SCHEMA_VERSION
+
+    # update_metadata（读-改-写路径）同样必须补上版本号
+    updated = engine.update_metadata(
+        "fund_nav", "510300", lambda m: {**m, "note": "x"}, dimensions=dims
+    )
+    assert updated["schema_version"] == METADATA_SCHEMA_VERSION
+    assert engine.read_metadata("fund_nav", "510300", dimensions=dims)["schema_version"] == METADATA_SCHEMA_VERSION
+
+
+def test_metadata_without_schema_version_is_read_as_legacy():
+    """存量 meta.json 没有 schema_version：必须继续兼容读取，不能被当成损坏文件。"""
+    engine = ParquetStorageEngine(base_dir=TEST_CACHE_DIR)
+    dims = {"source": "cmtidp"}
+    _, m_path = engine.get_paths("fund_nav", "168701", dims)
+    os.makedirs(os.path.dirname(m_path), exist_ok=True)
+    with open(m_path, "w", encoding="utf-8") as f:
+        json.dump({"key": "168701", "intervals": [["2024-01-01", "2024-01-31"]]}, f)
+
+    meta = engine.read_metadata("fund_nav", "168701", dimensions=dims)
+    assert meta is not None
+    assert meta["intervals"] == [["2024-01-01", "2024-01-31"]]
+    assert meta.get("schema_version") is None   # 读取不替调用方编造版本号
+
+
+def test_metadata_with_future_schema_version_is_rejected(caplog):
+    """更高版本的 meta 不能按当前语义猜测读取（可能标错覆盖区间），按"无元数据"处理并告警。"""
+    engine = ParquetStorageEngine(base_dir=TEST_CACHE_DIR)
+    dims = {"source": "eastmoney"}
+    _, m_path = engine.get_paths("fund_nav", "510300", dims)
+    os.makedirs(os.path.dirname(m_path), exist_ok=True)
+    with open(m_path, "w", encoding="utf-8") as f:
+        json.dump({"key": "510300", "intervals": [["2024-01-01", "2024-01-31"]],
+                   "schema_version": METADATA_SCHEMA_VERSION + 1}, f)
+
+    with caplog.at_level("WARNING"):
+        meta = engine.read_metadata("fund_nav", "510300", dimensions=dims)
+
+    assert meta is None
+    assert any("schema_version" in r.message for r in caplog.records)
+
