@@ -238,3 +238,38 @@ async def test_kline_guard_counts_system_exception_as_failure(monkeypatch):
 
     assert calls == [("xueqiu", False, "business")]
 
+@pytest.mark.asyncio
+async def test_kline_provider_reuses_single_xueqiu_instance(tmp, monkeypatch):
+    """D13：XueqiuProvider 必须复用同一实例，否则实例级 Cookie 缓存（10 分钟）形同虚设，
+    每次 K 线请求都可能重新走一次鉴权网关（Valkey 不可用时更明显）。"""
+    import contextlib
+
+    from providers.quotes import xueqiu as xq_mod
+
+    created = []
+    fetched = []
+
+    class _FakeXueqiu:
+        def __init__(self, cache_manager=None):
+            created.append(self)
+            self.cache_manager = cache_manager
+
+        async def _fetch_kline_slice(self, symbol, slice_start, slice_end, period_str, adjust_type, on_chunk=None):
+            fetched.append((slice_start, slice_end))
+            return [{"date": slice_start, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+                     "volume": 1.0, "amount": 1.0}]
+
+    @contextlib.asynccontextmanager
+    async def _noop_guard():
+        yield
+
+    monkeypatch.setattr(xq_mod, "XueqiuProvider", _FakeXueqiu)
+    monkeypatch.setattr(xq_mod, "kline_guard", _noop_guard)
+
+    p = KLineProvider(base_dir=tmp)
+    await p.get_kline("002092.SZ", "2026-01-01", "2026-01-31")
+    await p.get_kline("002092.SZ", "2026-02-01", "2026-02-28")
+
+    assert len(fetched) == 2
+    assert len(created) == 1, f"XueqiuProvider 被创建了 {len(created)} 次，Cookie 缓存无法复用"
+

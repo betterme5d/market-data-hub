@@ -47,8 +47,12 @@ class KLineProvider:
         self,
         base_dir: str | Path = "data/cache",
         cache_manager: Optional[TimeSeriesCacheManager] = None,
+        xueqiu_provider: Optional[Any] = None,
     ):
         self.cache_manager = cache_manager or TimeSeriesCacheManager(base_dir=base_dir)
+        # D13：雪球取数实例必须复用（Cookie 是**实例级**缓存，10 分钟内不重复走鉴权网关）；
+        # 也支持外部注入，便于测试与将来换成模块级单例。
+        self._xueqiu_provider = xueqiu_provider
 
     async def get_kline(
         self,
@@ -160,7 +164,10 @@ class KLineProvider:
         if source == "xueqiu":
             from providers.quotes.xueqiu import XueqiuProvider, kline_guard
 
-            xq = XueqiuProvider(cache_manager=self.cache_manager)
+            # D13：复用同一个 XueqiuProvider（懒创建），Cookie/UA 实例级缓存才有效
+            if self._xueqiu_provider is None:
+                self._xueqiu_provider = XueqiuProvider(cache_manager=self.cache_manager)
+            xq = self._xueqiu_provider
             async with kline_guard():
                 return await xq._fetch_kline_slice(
                     symbol=standard_code,
