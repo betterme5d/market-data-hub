@@ -249,11 +249,36 @@ async def test_sse_incomplete_day_stays_uncovered():
 
     # 22/23 一个窗口；24 不完整 → 窗口在 23 结束，25 处重开
     assert windows == [("2026-06-22", "2026-06-23", 2), ("2026-06-25", "2026-06-26", 2)]
-    # 失败日已拿到的部分记录既不落盘也不返回，避免半天数据进缓存
-    assert sorted(r["share_date"] for r in records["510050"]) == [
-        "2026-06-22", "2026-06-23", "2026-06-25", "2026-06-26",
-    ]
+    # 失败日已拿到的部分记录既不落盘也不返回，避免半天数据进缓存；
+    # 且 D17 之后"有增量回调时"不再保留整段全市场记录（数据已逐窗口落盘）
+    assert records == {}
 
+
+@pytest.mark.asyncio
+async def test_sse_fetch_range_with_on_window_does_not_retain_full_records():
+    """D17：有增量回调时不再在内存里累积整段全市场记录，只保留当前窗口缓冲。
+
+    10 年沪市回补 = 2000+ 个交易日 × 全市场基金，整段累积会常驻数百 MB。
+    """
+    source = SseShareSource(delay_ms=0)
+    windows = []
+
+    async def mock_checked(day):
+        return {"510050": {"code": "510050", "share_date": day, "shares": 1.0}}, True
+
+    with patch.object(source, "fetch_daily_market_shares_checked", side_effect=mock_checked):
+        records = await source.fetch_market_shares_range(
+            "2026-06-22", "2026-06-26",
+            on_window=lambda w, s, e: windows.append((s, e)),
+            flush_every_days=2,
+        )
+
+    assert windows == [
+        ("2026-06-22", "2026-06-23"),
+        ("2026-06-24", "2026-06-25"),
+        ("2026-06-26", "2026-06-26"),
+    ]
+    assert records == {}, "有回调时数据已逐窗口落盘，不应再返回/保留整段记录"
 
 @pytest.mark.asyncio
 async def test_sse_pre_2012_days_are_complete():

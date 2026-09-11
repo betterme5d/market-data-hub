@@ -258,6 +258,8 @@ class SseShareSource:
             时再调用一次收尾。没有它的话，一次 HTTP 中断就意味着整段逐日拉取的工作全部作废。
             窗口是**日历连续**的（跨过期间的非交易日），因此相邻窗口的覆盖区间会合并成一整段。
         :param flush_every_days: 增量落盘的交易日间隔。
+        :return: 未传 on_window 时返回整段全市场记录；传了 on_window 时数据已逐窗口交给回调，
+            返回空字典（有回调方就没有必要再整段常驻内存）。
         """
         days_info = get_exchange_trading_days("CN", start_date, end_date)
         trading_days = [d["date"] for d in days_info if d.get("is_trading")]
@@ -300,7 +302,10 @@ class SseShareSource:
                     if window_start is None:
                         window_start = cursor
                     for code, rec in daily_data.items():
-                        all_records[code].append(rec)
+                        # D17：有增量回调时数据已随窗口落盘，不再整段累积——
+                        # 10 年回补 = 2000+ 交易日 × 全市场基金，整段累积会常驻数百 MB。
+                        if on_window is None:
+                            all_records[code].append(rec)
                         window_records[code].append(rec)
                     window_end = day
                 else:
