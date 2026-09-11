@@ -258,6 +258,7 @@ class CmtidpSource(FundNavProvider):
                     total = 0
 
             rows = data.get("aaData") or []
+            page_items: List[FundNav] = []
             for row in rows:
                 nav_date = row.get("valuationDate")
                 if not nav_date:
@@ -270,21 +271,52 @@ class CmtidpSource(FundNavProvider):
                 prev = collected.get(key)
                 if prev is not None and prev.accum_nav is not None and accum_nav is None:
                     continue  # 已有完整行，不用「缺累计净值」的行覆盖
-                collected[key] = FundNav(
+                item = FundNav(
                     code=code,
                     nav_date=nav_date,
                     unit_nav=unit_nav,
                     accum_nav=accum_nav,
                 )
+                collected[key] = item
+                page_items.append(item)
 
             offset += len(rows)
+            is_last_page = (not rows) or bool(total and offset >= total)
+
             if not rows:
                 if total and offset < total:
                     raise RuntimeError(
                         f"CMTIDP 历史净值不完整：{code} 已取 {offset}/{total} 行，拒绝返回半份数据"
                     )
+            else:
+                # 逐页流式回调：缓存层据此即时落盘，中途失败/断线只损失当前页
+                await self._emit_page(on_page, page_items, is_last_page, start)
+
+            if not rows:
                 break
             if total and offset >= total:
                 break
 
         return sorted(collected.values(), key=lambda x: x.nav_date)
+
+    @staticmethod
+    async def _emit_page(
+        on_page: Optional[Callable[[List[FundNav], str, str], Awaitable[None]]],
+        page_items: List[FundNav],
+        is_last_page: bool,
+        slice_start: str,
+    ) -> None:
+        """逐页流式回调：把本页已解析的记录与覆盖区间交给缓存层即时落盘。
+
+        覆盖区间取本页日期的最小/最大值；最后一页把下界延伸到请求起始日（与东财爬虫同口径）。
+        没有回调时保持原行为（缓存层退化为整段落盘）。
+        """
+        if on_page is None or not page_items:
+            return
+        dates = [str(item.nav_date) for item in page_items if item.nav_date]
+        if not dates:
+            return
+        cov_s = str(slice_start) if is_last_page else min(dates)
+        cov_e = max(dates)
+        if cov_s <= cov_e:
+            await on_page(page_items, cov_s, cov_e)

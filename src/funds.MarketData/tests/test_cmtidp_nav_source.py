@@ -206,3 +206,30 @@ async def test_latest_all_nav_applies_polite_delay():
 
     # 09-11 需 3 页（第 2、3 页各一次延时）+ 后两个交易日各一次 → 至少 3 次
     assert mock_delay.call_count >= 3
+
+
+@pytest.mark.asyncio
+async def test_history_streams_pages_via_on_page():
+    """CMTIDP 历史净值必须逐页回调 on_page（缓存层靠它即时落盘）。"""
+    src = CmtidpSource()
+    by_day = {
+        "2026-09-11": [
+            _row("510300", "2026-09-11", "1.0"),
+        ],
+    }
+    calls = []
+
+    async def _collect(page_items, cov_s, cov_e):
+        calls.append((len(page_items), cov_s, cov_e))
+
+    with patch("providers.funds.cmtidp._CMTIDP_PAGE_SIZE", 1), patch.object(
+        src, "_fetch_page", side_effect=_fake_upstream(by_day)
+    ):
+        items = await src.get_fund_nav_history(
+            "510300", "2026-09-11", "2026-09-11", on_page=_collect
+        )
+
+    assert len(items) == 1
+    assert len(calls) == 1
+    assert calls[0][0] == 1
+    assert calls[0][1] == "2026-09-11" and calls[0][2] == "2026-09-11"

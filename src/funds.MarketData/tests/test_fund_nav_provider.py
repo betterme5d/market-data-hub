@@ -169,3 +169,45 @@ async def test_cmtidp_pagination_consistency():
         assert len(paged_rows) == 6
         assert len(direct_rows) == 6
         assert paged_rows == direct_rows
+
+
+@pytest.mark.asyncio
+async def test_cmtidp_partial_persist_on_midway_failure():
+    """CMTIDP 中途分页失败：已拉到的页必须已通过 on_page 落盘，不能整段作废。"""
+    from providers.funds.cmtidp import CmtidpSource
+
+    cache_manager = TimeSeriesCacheManager(base_dir=TEST_CACHE_DIR)
+    src = CmtidpSource()
+    calls = {"n": 0}
+
+    async def _flaky(*, fund_code, start_date, end_date, start, length):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {
+                "iTotalRecords": 2,
+                "aaData": [
+                    {
+                        "code": "510300",
+                        "valuationDate": "2026-09-09",
+                        "shareNetValue": "3.5000",
+                        "totalNetValue": "4.5000",
+                    }
+                ],
+            }
+        return None
+
+    provider = FundNavProvider(cache_manager=cache_manager, cmtidp_source=src)
+
+    with patch("providers.funds.cmtidp._CMTIDP_PAGE_SIZE", 1), patch.object(
+        src, "_fetch_page", side_effect=_flaky
+    ):
+        with pytest.raises(RuntimeError):
+            await provider.get_fund_nav_history(
+                "510300", "2026-09-01", "2026-09-30", source="cmtidp"
+            )
+
+    meta = cache_manager.storage.read_metadata(
+        "fund_nav", "510300", dimensions={"source": "cmtidp"}
+    )
+    assert meta is not None, "第一页必须已落盘（on_page 流式）"
+    assert meta["intervals"] == [["2026-09-09", "2026-09-09"]]
