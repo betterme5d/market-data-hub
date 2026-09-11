@@ -121,15 +121,55 @@ class ListingDateProvider:
         self._mem_cache: Dict[str, Dict[str, str]] = {}
 
     async def _fetch_and_cache(self, exchange: str, force: bool = False) -> Dict[str, str]:
-        """获取某交易所全量上市日期，必要时从上游拉取并写文件/内存。"""
+        """获取某交易所全量上市日期，必要时从上游拉取并写文件/内存。
+
+        写盘前的三道防线——交易所列表是下游净值/份额的**白名单**，一旦被"截断快照"写短，
+        真实场内基金会整批被过滤掉（数据静默丢失），因此：
+        1. 上游报错：有旧快照就降级服务旧快照（告警），一片空白才把错误抛给调用方；
+        2. 上游返回空：不覆盖旧快照（无旧快照时抛错，不能静默吐出空白名单）；
+        3. 上游返回行数比旧快照少：落盘为「旧 ∪ 新」并告警——新增代码立即生效，
+           被截断/下架的旧代码不会被清掉（白名单宁可多、不可少；下架代码多留一条无副作用）。
+        """
         if not force and not _is_stale(exchange):
             cached = _load_cache(exchange)
             if cached is not None:
                 self._mem_cache[exchange] = cached
                 return cached
 
+        previous = _load_cache(exchange)
         source = _LISTING_DATE_SOURCES[exchange]
-        data = await source.fetch_listing_dates()
+        try:
+            data = await source.fetch_listing_dates()
+        except Exception as e:
+            if previous:
+                logger.warning(
+                    f"listing dates fetch failed for {exchange} ({e}); "
+                    f"serving stale snapshot with {len(previous)} rows"
+                )
+                self._mem_cache[exchange] = previous
+                return previous
+            raise
+
+        if not data:
+            if previous:
+                logger.warning(
+                    f"listing dates for {exchange} came back empty; "
+                    f"keeping cached snapshot with {len(previous)} rows"
+                )
+                self._mem_cache[exchange] = previous
+                return previous
+            raise RuntimeError(
+                f"listing dates for {exchange} came back empty and no cache is available"
+            )
+
+        if previous and len(data) < len(previous):
+            merged = {**previous, **data}   # 新值优先，旧代码保留
+            logger.warning(
+                f"listing dates for {exchange} shrank from {len(previous)} to {len(data)} rows; "
+                f"persisting the union ({len(merged)} rows) to keep the whitelist from shrinking"
+            )
+            data = merged
+
         _save_cache(exchange, data)
         self._mem_cache[exchange] = data
         return data

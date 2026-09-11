@@ -284,21 +284,25 @@ class SzseFundListSource:
     )
 
     async def _fetch_report(self) -> list:
-        """请求 1105 报表并解析（业务与探针共用同一代码路径）。"""
+        """请求 1105 报表并解析（业务与探针共用同一代码路径）。
+
+        非 200 必须抛错而不是返回空列表：空列表会被上层当成"上游这条真的没有数据"，
+        进而把白名单缓存清空（下游净值/份额按白名单过滤，清空等于丢弃全部场内基金）。
+        """
         url = f"{self.URL}&random={time.time()}"
         async with httpx.AsyncClient(verify=False) as client:
             resp = await client.get(url, timeout=30)
             if resp.status_code != 200:
-                return []
+                raise RuntimeError(f"SZSE 1105 report HTTP {resp.status_code}")
             return self._parse_xlsx(resp.content)
 
     async def fetch_funds(self) -> list:
-        """获取深交所 ETF/LOF/REITs 基金列表（含上市日期）。"""
+        """获取深交所 ETF/LOF/REITs 基金列表（含上市日期）。失败抛错，不返回空列表。"""
         try:
             return await self._fetch_report()
         except Exception as e:
             logger.error(f"Error fetching SZSE funds: {e}")
-            return []
+            raise
 
     def _parse_xlsx(self, content: bytes) -> list:
         """解析 1105 xlsx：基金代码/简称/类别/上市日期，归一 fund_type。"""

@@ -10,6 +10,7 @@ from datetime import date
 import httpx
 
 from core import config
+from core.pacing import polite_delay
 from providers.base import SourceProbe
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,7 @@ class SseFundListProbe(SourceProbe):
         """
         rows = await SseFundListSource()._fetch_list(
             fund_type="00", sub_class=SseFundListSource.ETF_SUB_CLASS, page_size=10,
+            max_pages=1,   # 探针只取一页：真翻页是给业务用的，探针拉全量会拖慢健康检查
         )
         if not rows or not rows[0].get("fund_code"):
             raise RuntimeError("sse-fund-list probe: unexpected response shape (missing 'result'/'fundCode')")
@@ -110,37 +112,104 @@ class SseFundListSource:
         }
 
     @staticmethod
-    def _list_url(fund_type: str, sub_class: str, page_size: int) -> str:
+    def _list_url(fund_type: str, sub_class: str, page_size: int, page_no: int = 1) -> str:
         return (
             "https://query.sse.com.cn/commonSoaQuery.do?isPagination=true"
             f"&pageHelp.pageSize={page_size}"
-            "&pageHelp.pageNo=1&pageHelp.beginPage=1&pageHelp.cacheSize=1&pageHelp.endPage=1"
+            f"&pageHelp.pageNo={page_no}&pageHelp.beginPage={page_no}"
+            "&pageHelp.cacheSize=1"
+            f"&pageHelp.endPage={page_no}"
             "&pagecache=false&sqlId=FUND_LIST"
             f"&fundType={fund_type}&subClass={sub_class}&order="
         )
 
-    async def _fetch_list(self, fund_type: str, sub_class: str, page_size: int) -> list:
-        """请求一类基金列表并解析为统一结构（业务与探针共用同一代码路径）。"""
-        rows: list = []
+    @staticmethod
+    def _to_row(item: dict, fund_type: str, exchange: str) -> dict:
+        """上游一条 ETF/LOF 记录 → 统一结构。"""
+        return {
+            "fund_code": item.get("fundCode"),
+            "fund_name": item.get("secNameFull") or item.get("fundAbbr"),
+            "fund_type": "ETF" if fund_type == "00" else "LOF",
+            "exchange": exchange,
+            "list_date": _normalize_listing_date(item.get("listingDate")),
+        }
+
+    async def _fetch_page(
+        self, fund_type: str, sub_class: str, page_size: int, page_no: int
+    ) -> tuple:
+        """请求一页，返回 (行列表, 上游自述总条数)；总条数缺失返回 None。"""
         async with httpx.AsyncClient(verify=False) as client:
             resp = await client.get(
-                self._list_url(fund_type, sub_class, page_size),
+                self._list_url(fund_type, sub_class, page_size, page_no),
                 headers=self.headers, timeout=30,
             )
-            if resp.status_code == 200:
-                for item in resp.json().get("result", []):
-                    rows.append({
-                        "fund_code": item.get("fundCode"),
-                        "fund_name": item.get("secNameFull") or item.get("fundAbbr"),
-                        "fund_type": "ETF" if fund_type == "00" else "LOF",
-                        "exchange": self.EXCHANGE,
-                        "list_date": _normalize_listing_date(item.get("listingDate")),
-                    })
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"SSE fund list HTTP {resp.status_code} (fundType={fund_type}, pageNo={page_no})"
+                )
+            payload = resp.json() or {}
+            items = payload.get("result") or []
+            page_help = payload.get("pageHelp") or {}
+            try:
+                total = int(page_help.get("total"))
+            except (TypeError, ValueError):
+                total = None   # 上游没给总数：退回"短页即末页"的单页语义
+            return [self._to_row(item, fund_type, self.EXCHANGE) for item in items], total
+
+    async def _fetch_list(
+        self, fund_type: str, sub_class: str, page_size: int, max_pages: int | None = None,
+    ) -> list:
+        """分页拉取一类基金列表（业务与探针共用同一代码路径）。
+
+        交易所对 pageSize 有封顶：请求 10000 条也可能只回 1000 条，单页取数会**静默截断**。
+        列表是下游净值/份额的白名单，白名单变短会把真实场内基金整批过滤掉（数据静默丢失），
+        因此这里按上游自述的 pageHelp.total 真翻页，并在取不满时报错（由上层保留旧快照）。
+
+        :param max_pages: 只取前 N 页（健康探针用，避免探针拖成全量拉取）。
+        """
+        rows: list = []
+        seen: set = set()
+        total = None
+        page_no = 1
+        while True:
+            page_rows, page_total = await self._fetch_page(fund_type, sub_class, page_size, page_no)
+            if page_total is not None:
+                total = page_total
+            new_codes = 0
+            for row in page_rows:
+                code = row.get("fund_code")
+                if not code or code in seen:
+                    continue
+                seen.add(code)
+                rows.append(row)
+                new_codes += 1
+
+            if max_pages is not None and page_no >= max_pages:
+                break
+            if total is not None and len(rows) >= total:
+                break
+            if not page_rows or new_codes == 0:
+                # 空页，或上游忽略了 pageNo（重复返回同一页）→ 不能再翻，交给下面的完整性校验判错
+                break
+            if total is None and len(page_rows) < page_size:
+                break
+            page_no += 1
+            await polite_delay()   # 翻页之间的礼貌延时（0.2~0.5s）
+
+        if max_pages is None and total is not None and len(rows) < total:
+            raise RuntimeError(
+                f"SSE fund list incomplete for fundType={fund_type}: got {len(rows)} of {total} rows"
+            )
         return rows
 
     async def fetch_funds(self) -> list:
-        """获取上交所 ETF 与 LOF 基金列表。"""
+        """获取上交所 ETF 与 LOF 基金列表。
+
+        任一分类拉取失败即抛错：半份列表一旦写进白名单缓存，会把真实场内基金整个过滤掉，
+        必须让调用方看到失败并保留旧快照（缓存层会降级服务）。
+        """
         results: list = []
+        failures: list = []
         for fund_type, sub_class, ftype in (
             ("00", self.ETF_SUB_CLASS, "ETF"),
             ("10", self.LOF_SUB_CLASS, "LOF"),
@@ -149,4 +218,8 @@ class SseFundListSource:
                 results.extend(await self._fetch_list(fund_type, sub_class, page_size=10000))
             except Exception as e:
                 logger.error(f"Error fetching SSE {ftype} funds: {e}")
+                failures.append(f"{ftype}: {e}")
+
+        if failures:
+            raise RuntimeError("SSE fund list fetch failed -> " + "; ".join(failures))
         return results
