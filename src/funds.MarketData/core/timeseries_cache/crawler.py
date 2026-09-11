@@ -89,6 +89,43 @@ class PaginatedSliceCrawler:
         total: Optional[int] = None
         # 页数兜底：上游一直返回非空短页（限流抖动）时不能无限翻页
         max_pages = 2000
+        # 总数缺失时的"疑似末页"挂起槽：(页数据, 页码)。
+        # 短页只能算疑似末页，必须再取一页确认（空页=确认）；否则上游静默封顶（限流/接口变更
+        # 只回固定条数）会被当成末页，末页规则把覆盖区间一路标到请求边界，缺口被永久固化成"已覆盖"。
+        pending: Optional[tuple] = None
+
+        async def _emit(page_items: List[T], page_number: int, is_last_page: bool) -> None:
+            """推导本页覆盖区间并触发 on_page 回调（desc/asc 两套规则）。"""
+            nonlocal effective_upper
+            if on_page is None or not page_items:
+                return
+            if order == "desc":
+                # 倒序：第一页包含最新的日期，检查 T 日是否已出
+                if page_number == start_page and effective_upper and effective_upper >= today_str:
+                    has_today = any(date_getter(r) == today_str for r in page_items)
+                    if not has_today:
+                        effective_upper = min(effective_upper, yesterday_str)
+
+                page_min_date = min(date_getter(r) for r in page_items)
+                # 最后一页（最旧一页）才把覆盖下界延到切片起始日期
+                cov_s = effective_lower if (is_last_page and effective_lower) else page_min_date
+                cov_e = effective_upper or max(date_getter(r) for r in page_items)
+            else:  # order == "asc"
+                page_max_date = max(date_getter(r) for r in page_items)
+                if is_last_page and effective_upper and effective_upper >= today_str:
+                    has_today = any(date_getter(r) == today_str for r in page_items)
+                    if not has_today:
+                        effective_upper = min(effective_upper, yesterday_str)
+
+                page_min_date = min(date_getter(r) for r in page_items)
+                # 正序：只有第一页（最旧一页）才把覆盖下界延到切片起始日期。
+                # 中途页若也延到请求起点，会把 [请求起点, 本页最大日期] 整段标成"已覆盖"，
+                # 上游跳页/静默封顶造成的空洞就被永久固化了。
+                cov_s = effective_lower if (page_number == start_page and effective_lower) else page_min_date
+                cov_e = effective_upper if (is_last_page and effective_upper) else page_max_date
+
+            if cov_s <= cov_e:
+                await on_page(page_items, cov_s, cov_e)
 
         while True:
             # 翻页抖动延时（从第二页开始触发）
@@ -121,80 +158,47 @@ class PaginatedSliceCrawler:
                 total = batch.total_count
 
             page_items = batch.items
+
+            # 先结清上一页的"疑似末页"：本页为空 → 上一页确实是末页（覆盖区间可延到请求边界）；
+            # 本页有数据 → 上一页只是短页，按普通页结清（覆盖区间只到它自己的日期范围）。
+            if pending is not None:
+                pending_items, pending_page = pending
+                pending = None
+                if not page_items:
+                    await _emit(pending_items, pending_page, is_last_page=True)
+                    break
+                await _emit(pending_items, pending_page, is_last_page=False)
+
             items.extend(page_items)
             seen += len(page_items)
 
             # 末页判定：
-            # - 上游给了总数（>0）就以总数为准——中途的短页可能是限流/抖动，若按"短页即末页"提前收尾，
-            #   末页规则会把覆盖区间一路标到请求起点，缺口就被永久标成"已覆盖"；
-            # - 总数缺失（东财返回 0 或缺键）才退回"短页即末页"的启发式；
+            # - 上游给了总数（>0）就以总数为准——中途短页可能是限流/抖动，若按"短页即末页"提前收尾，
+            #   末页规则会把覆盖区间一路标到请求起点，缺口被永久标成"已覆盖"；
+            # - 总数缺失时空页直接收尾；短页只算"疑似末页"，靠下一页确认（见上面的 pending 结清）；
             # - 页数不超过总数推导值 +5（应对偶发短页）且不超过 max_pages。
+            total_known = total is not None and total > 0
+            is_last = (not page_items) or (total_known and seen >= total)
             page_cap = max_pages
-            if total is not None and total > 0:
+            if total_known:
                 page_cap = min(max_pages, (total + page_size - 1) // page_size + 5)
-                is_last = seen >= total
-            else:
-                is_last = (not page_items) or (len(page_items) < page_size)
-            if not page_items:
-                is_last = True
             if page_index - start_page + 1 >= page_cap:
                 logger.warning(
                     f"crawl_slice reached page cap {page_cap} (total={total}, seen={seen}); stopping pagination"
                 )
                 is_last = True
 
-            # 只要本页请求成功，立即推导覆盖区间并执行 on_page 回调
-            if on_page is not None:
-                if order == "desc":
-                    # 倒序：第一页包含最新的日期，检查 T 日是否已出
-                    if page_index == start_page and effective_upper and effective_upper >= today_str:
-                        has_today = any(date_getter(r) == today_str for r in page_items)
-                        if not has_today:
-                            effective_upper = min(effective_upper, yesterday_str)
-
-                    if not page_items:
-                        # 空数据：**不能**把它记为"该区间已覆盖"。
-                        # 上游静默失败（限流/接口异常返回空）与"确实没有数据"从响应上无法区分，
-                        # 一旦记为已覆盖，之后重跑只会从缓存拿到空、永远不再问上游，错误被静默固化。
-                        # 代价：真没数据的窗口每次补录会重问一次上游（一次请求，可接受）；
-                        # 需要彻底停止重问时由人工在明细里标"人工忽略"。
-                        logger.warning(
-                            f"crawl_slice got an empty page for [{start_date} ~ {end_date}]; "
-                            f"该区间不记为已覆盖（可能是上游失败），下次会重取"
-                        )
-                    else:
-                        page_min_date = min(date_getter(r) for r in page_items)
-                        # 最后一页时，覆盖下界延伸至切片起始日期 effective_lower
-                        cov_s = effective_lower if (is_last and effective_lower) else page_min_date
-                        cov_e = effective_upper or max(date_getter(r) for r in page_items)
-                        if cov_s <= cov_e:
-                            await on_page(page_items, cov_s, cov_e)
-
-                else:  # order == "asc"
-                    # 正序：第一页包含最旧的日期，往后拉到最新
-                    if not page_items:
-                        # 同上：空页不记覆盖
-                        logger.warning(
-                            f"crawl_slice got an empty page for [{start_date} ~ {end_date}]; "
-                            f"该区间不记为已覆盖（可能是上游失败），下次会重取"
-                        )
-                    else:
-                        page_max_date = max(date_getter(r) for r in page_items)
-                        # 如果最新页包含 today，检查是否到了 today
-                        if is_last and effective_upper and effective_upper >= today_str:
-                            has_today = any(date_getter(r) == today_str for r in page_items)
-                            if not has_today:
-                                effective_upper = min(effective_upper, yesterday_str)
-
-                        cov_s = effective_lower or min(date_getter(r) for r in page_items)
-                        cov_e = effective_upper if (is_last and effective_upper) else page_max_date
-                        if cov_s <= cov_e:
-                            await on_page(page_items, cov_s, cov_e)
-
             if is_last:
+                await _emit(page_items, page_index, is_last_page=True)
                 break
-            page_index += 1
 
+            if page_items and not total_known and len(page_items) < page_size:
+                # 疑似末页：挂起，等下一页确认后再按末页规则结清覆盖区间
+                pending = (page_items, page_index)
+            else:
+                await _emit(page_items, page_index, is_last_page=False)
+
+            page_index += 1
         # 统一按日期升序排序
         items.sort(key=date_getter)
         return items

@@ -104,8 +104,10 @@ async def test_crawler_ascending_multi_page_with_on_page():
         assert callback_calls[0][1] == "2024-01-01"
         assert callback_calls[0][2] == "2024-01-10"
 
-        # 第 2 页（最后一页）：覆盖至切片截止日期 2024-01-31
-        assert callback_calls[1][1] == "2024-01-01"
+        # 第 2 页：正序下**只有第一页**才是"最旧一页"，中途/末页只能标自己这一页的日期范围。
+        # 旧实现每页都把覆盖下界拉回请求起点（2024-01-01），一旦上游跳页/短页，
+        # [2024-01-11 ~ 2024-01-24] 这段空洞会被标成"已覆盖"而永久固化。
+        assert callback_calls[1][1] == "2024-01-25"
         assert callback_calls[1][2] == "2024-01-31"
 
 
@@ -114,8 +116,8 @@ async def test_crawler_single_page_retry_succeeds():
     crawler = PaginatedSliceCrawler(max_retries=3, retry_base_delay=0.01)
 
     p1 = PageBatch(items=[{"date": "2024-01-05", "val": 1}])
-    # 第一次抛异常，第二次成功
-    fetch_mock = AsyncMock(side_effect=[Exception("503 Service Unavailable"), p1])
+    # 第一次抛异常，第二次成功；总数缺失时短页只是"疑似末页"，还要再取一页（空页）确认
+    fetch_mock = AsyncMock(side_effect=[Exception("503 Service Unavailable"), p1, PageBatch(items=[])])
 
     with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         res = await crawler.crawl_slice(
@@ -126,7 +128,8 @@ async def test_crawler_single_page_retry_succeeds():
             date_getter=lambda x: x["date"],
         )
         assert len(res) == 1
-        assert fetch_mock.call_count == 2
+        # 1 次失败重试 + 成功页 + 1 次"空页确认"（总数缺失时短页不算末页）
+        assert fetch_mock.call_count == 3
         # 验证退避重试休眠被调用
         assert mock_sleep.call_count >= 1
 
@@ -224,3 +227,106 @@ async def test_crawler_short_middle_page_does_not_end_pagination():
     assert len(items) == 42
     # 最后一页是第 3 页（19 < 20）且已取满 total，覆盖区间按末页规则延到请求起点
     assert covered[-1][0] == "2024-01-01"
+
+@pytest.mark.asyncio
+async def test_crawler_asc_middle_page_does_not_reclaim_lower_bound():
+    """D20：正序爬取时，非首页不得把覆盖下界拉回请求起点（否则空洞被永久标成已覆盖）。"""
+    crawler = PaginatedSliceCrawler(min_delay=0, max_delay=0)
+
+    pages = {
+        1: [{"date": "2024-01-02"}, {"date": "2024-01-10"}],
+        2: [{"date": "2024-01-25"}],          # 上游跳过了 01-11 ~ 01-24
+    }
+
+    async def fetch_page(page_index, page_size, s_, e_):
+        return PageBatch(items=pages.get(page_index, []), total_count=3)
+
+    covered = []
+
+    async def _on_page(recs, cs, ce):
+        covered.append((cs, ce))
+
+    items = await crawler.crawl_slice(
+        "2024-01-01", "2024-01-31",
+        page_size=2,
+        fetch_page_fn=fetch_page,
+        date_getter=lambda x: x["date"],
+        order="asc",
+        on_page=_on_page,
+    )
+
+    assert len(items) == 3
+    # 第一页（最旧一页）覆盖到请求起点；第二页只能覆盖自己这一天，空洞留给下次重取
+    assert covered == [("2024-01-01", "2024-01-10"), ("2024-01-25", "2024-01-31")]
+
+
+@pytest.mark.asyncio
+async def test_crawler_short_page_without_total_needs_confirmation_before_last():
+    """D21：总数缺失时，短页不能直接当末页。
+
+    上游静默封顶（限流/接口变更只回固定条数）会让"短页即末页"把覆盖区间一路标到请求边界，
+    缺口被永久固化；必须再取一页：空页才算确认，有数据就说明上一页只是抖动。
+    """
+    crawler = PaginatedSliceCrawler(min_delay=0, max_delay=0)
+
+    pages = {
+        1: [{"date": "2024-03-29"}, {"date": "2024-03-20"}],   # total 缺失 → 短页（pageSize=3）
+        2: [{"date": "2024-03-15"}],                           # 还有数据 → 第 1 页不是末页
+        3: [{"date": "2024-03-01"}],
+    }
+    calls = []
+
+    async def fetch_page(page_index, page_size, s_, e_):
+        calls.append(page_index)
+        return PageBatch(items=pages.get(page_index, []))   # 上游不给总数
+
+    covered = []
+
+    async def _on_page(recs, cs, ce):
+        covered.append((cs, ce))
+
+    items = await crawler.crawl_slice(
+        "2024-03-01", "2024-03-31",
+        page_size=3,
+        fetch_page_fn=fetch_page,
+        date_getter=lambda x: x["date"],
+        order="desc",
+        on_page=_on_page,
+    )
+
+    # 3 页数据 + 1 次"空页确认"
+    assert calls == [1, 2, 3, 4]
+    assert len(items) == 4
+    # 第 1 页（短页但仍有后续数据）不得把覆盖区间标到请求起点
+    assert covered[0] == ("2024-03-20", "2024-03-31")
+    # 只有被"空页"确认过的那一页才按末页规则覆盖到请求起点
+    assert covered[-1] == ("2024-03-01", "2024-03-31")
+
+
+@pytest.mark.asyncio
+async def test_crawler_short_page_without_total_confirmed_by_empty_page():
+    """总数缺失 + 单页短页 → 取下一页为空后，才按末页规则把覆盖区间延到请求起点。"""
+    crawler = PaginatedSliceCrawler(min_delay=0, max_delay=0)
+
+    async def fetch_page(page_index, page_size, s_, e_):
+        if page_index == 1:
+            return PageBatch(items=[{"date": "2024-01-05"}])
+        return PageBatch(items=[])
+
+    covered = []
+
+    async def _on_page(recs, cs, ce):
+        covered.append((cs, ce))
+
+    items = await crawler.crawl_slice(
+        "2024-01-01", "2024-01-31",
+        page_size=10,
+        fetch_page_fn=fetch_page,
+        date_getter=lambda x: x["date"],
+        order="desc",
+        on_page=_on_page,
+    )
+
+    assert len(items) == 1
+    assert covered == [("2024-01-01", "2024-01-31")]
+
