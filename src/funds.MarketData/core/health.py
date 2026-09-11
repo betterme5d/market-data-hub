@@ -14,7 +14,7 @@ import logging
 import time
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from core import config
 from core.cache import redis_client
@@ -177,16 +177,30 @@ async def run_probe(source: str) -> Dict[str, Any]:
 
 
 async def probe_idle_sources() -> List[Dict[str, Any]]:
-    """探测所有 idle（超过 HEALTH_IDLE_SECONDS 无业务流量）的已注册源。"""
+    """探测 idle 的已注册源（按「最近一次记录最久」优先，每轮有上限）。
+
+    节流说明：主动探测本身也会写入一条 via="probe" 记录，而 idle 判定看的是「最近一条记录」，
+    因此同一源被探测后，在 HEALTH_IDLE_SECONDS 内不会再次入选 —— 天然形成
+    「同一源最多约每 HEALTH_IDLE_SECONDS 探测一次」的节流（默认 600s，轮询间隔 300s）。
+
+    错峰闸门：到期的源若在同一轮里 asyncio.gather 一起探测，多个重型探针（全市场份额/列表）
+    会同时打上游；这里按最久未记录优先排序，每轮最多探测 HEALTH_PROBE_MAX_PER_ROUND 个，
+    余下的下一轮继续。
+    """
     now = time.time()
-    targets = []
+    candidates: List[Tuple[float, str]] = []
     for source in registered_sources():
         calls = _read_calls(source)
         last_ts = calls[-1]["ts"] if calls else None
         if last_ts is None or now - last_ts > config.HEALTH_IDLE_SECONDS:
-            targets.append(source)
-    if not targets:
+            candidates.append((last_ts or 0.0, source))
+
+    if not candidates:
         return []
+
+    candidates.sort()  # 最久没有记录的优先
+    limit = max(1, config.HEALTH_PROBE_MAX_PER_ROUND)
+    targets = [source for _, source in candidates[:limit]]
     results = await asyncio.gather(*(run_probe(s) for s in targets))
     return list(results)
 

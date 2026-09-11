@@ -53,6 +53,8 @@ HEALTH_IDLE_SECONDS = _get_int("HEALTH_IDLE_SECONDS", 600)
 HEALTH_PROBE_INTERVAL = _get_int("HEALTH_PROBE_INTERVAL", 300)
 # 单次主动探测超时（秒）
 HEALTH_PROBE_TIMEOUT = _get_float("HEALTH_PROBE_TIMEOUT", 5.0)
+# 每轮最多探测多少个源（错峰）：到期的源若一起探测，重型探针（全市场份额/列表）会并发打上游
+HEALTH_PROBE_MAX_PER_ROUND = _get_int("HEALTH_PROBE_MAX_PER_ROUND", 3)
 
 # ---------- 透传请求的默认超时（秒） ----------
 UPSTREAM_TIMEOUT = _get_float("UPSTREAM_TIMEOUT", 30.0)
