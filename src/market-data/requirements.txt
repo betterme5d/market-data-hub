@@ -1,0 +1,36 @@
+﻿fastapi
+uvicorn
+scalar-fastapi
+yfinance
+pandas
+lxml
+requests
+redis
+pytz
+pandas-market-calendars
+holidays
+akshare
+httpx
+curl_cffi>=0.7.4
+pyroscope-io
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0
+opentelemetry-instrumentation-fastapi==0.65b0
+opentelemetry-instrumentation-httpx==0.65b0
+pyarrow>=14.0.0
+
+# ---------------------------------------------------------------------------
+# 场内基金终止上市日抽取：沪市公告只提供 PDF（.json/.html 均 404，已实测），
+# 必须从 PDF 正文正则抽「终止上市日 / 摘牌时间」。深市走 JSON 正文，不需要。
+# 体积约 3MB，纯 Python 无二进制依赖。
+# ---------------------------------------------------------------------------
+pypdf>=4.0.0
+
+# ---------------------------------------------------------------------------
+# 测试依赖：本机没有可用的 Python 环境，容器本身就是测试环境
+# （dev 编排把 src/market-data 以 bind mount 挂到 /app，直接 docker exec 跑 pytest）。
+# 不装的话容器重建后 pytest 就没了，任何"已修复"的结论都无法验证。
+# 体积代价约 15MB，相对 pandas/pyarrow/akshare 可忽略。
+# ---------------------------------------------------------------------------
+pytest
+pytest-asyncio
