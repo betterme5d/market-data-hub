@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 Browser Proxy Service：持久化浏览器实例管理 + Cookie / 数据抓取网关。
 
@@ -7,6 +7,7 @@ Browser Proxy Service：持久化浏览器实例管理 + Cookie / 数据抓取�
 GET  /health                          健康探针
 GET  /api/v1/{site}/cookies           获取指定站点的认证 Cookie
 GET  /api/v1/{site}/kline             通过持久化页面复用获取站点 K 线数据
+GET  /xueqiu/auth                     雪球鉴权 Cookie（旧版路径，兼容 funds C# 与 market-data）
 
 新增站点只需在 ``_SITE_HANDLERS`` 注册即可，路由无需改动。
 """
@@ -52,6 +53,16 @@ PLAYWRIGHT_DEVTOOLS = os.getenv("PLAYWRIGHT_DEVTOOLS", "False").lower() == "true
 # ---------------------------------------------------------------------------
 # Pydantic 响应模型
 # ---------------------------------------------------------------------------
+
+class XueqiuAuthResponse(BaseModel):
+    """``/xueqiu/auth`` 的响应契约（旧版路径，详见该路由 docstring）。"""
+    success: bool = Field(..., description="是否成功获取到目标 Cookie")
+    cookie: str = Field(..., description="拼接后的 Cookie 字符串")
+    user_agent: str = Field(..., description="实际使用的 User-Agent（旧契约字段名）")
+    userAgent: str = Field(..., description="同一 UA 的 camelCase 别名（两个调用方都按这个拼法读）")
+    cookies_raw: List[Dict[str, Any]] = Field(default_factory=list, description="原始 Cookie 列表")
+    debug_info: str = Field(default="", description="调试信息")
+
 
 class CookieResponse(BaseModel):
     """Cookie 获取结果。"""
@@ -367,6 +378,42 @@ async def get_site_cookies(
             detail=f"Unknown site: '{site}'. Available: {available}",
         )
     return await handler(user_agent)
+
+
+@app.get(
+    "/xueqiu/auth",
+    response_model=XueqiuAuthResponse,
+    tags=["兼容接口"],
+    summary="雪球鉴权 Cookie（旧版路径）",
+)
+async def get_xueqiu_auth(
+    ua: Optional[str] = Query(None, description="自定义 User-Agent（旧版参数名）"),
+):
+    """旧版雪球鉴权端点，兼容历史调用方。
+
+    背景：2026-09 拆库时本文件经历 BOM + 单行损坏（robocopy），恢复后的版本只保留了
+    ``/api/v1/{site}/cookies``，``/xueqiu/auth`` 被弄丢。而两个调用方仍按旧路径调用：
+
+    - funds 的 C# ``XueqiuTokenService``：404 后它没有可用兜底（``Xueqiu__Cookie`` 为空），
+      会直接抛「无法获取有效的雪球 Token」，雪球 Token 刷新失败；
+    - market-data 的雪球 Provider：失败后只能退回直连 xueqiu.com 抓 Cookie，
+      绕过了浏览器指纹——正是本服务要解决的问题。
+
+    响应同时给出 ``user_agent``（旧契约字段名）与 ``userAgent``（两个调用方读取的拼法）；
+    只给前者会让它们静默退回各自的默认 UA，等于白拿一次真实 UA。
+    """
+    handler = _COOKIE_HANDLERS.get("xueqiu")
+    if handler is None:
+        raise HTTPException(status_code=404, detail="xueqiu cookie handler not registered")
+    resp: CookieResponse = await handler(ua)
+    return XueqiuAuthResponse(
+        success=resp.success,
+        cookie=resp.cookie,
+        user_agent=resp.user_agent,
+        userAgent=resp.user_agent,
+        cookies_raw=resp.cookies_raw,
+        debug_info=resp.debug_info,
+    )
 
 
 @app.get("/api/v1/{site}/kline")
