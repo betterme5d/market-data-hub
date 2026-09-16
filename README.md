@@ -1,4 +1,4 @@
-# marketdata-hub
+﻿# market-data-hub
 
 行情数据与浏览器爬虫服务仓库（自 `funds_pro` 单仓库拆出，git 历史经 filter-repo 迁移，作者/日期/提交信息完整保留）。
 
