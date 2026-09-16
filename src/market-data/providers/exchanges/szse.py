@@ -297,9 +297,15 @@ class SzseFundListSource:
             return self._parse_xlsx(resp.content)
 
     async def fetch_funds(self) -> list:
-        """获取深交所 ETF/LOF/REITs 基金列表（含上市日期）。失败抛错，不返回空列表。"""
+        """获取深交所 ETF/LOF 基金列表（含上市日期）。
+
+        REITs（不动产基金，代码 180xxx/1809xx）被排除：场内基金白名单仅保留 ETF/LOF，
+        REITs 的净值/份额机制与传统基金不同，混入白名单会导致下游估值引擎误分类。
+        失败抛错，不返回空列表。
+        """
         try:
-            return await self._fetch_report()
+            rows = await self._fetch_report()
+            return [r for r in rows if r.get("fund_type") in ("ETF", "LOF")]
         except Exception as e:
             logger.error(f"Error fetching SZSE funds: {e}")
             raise

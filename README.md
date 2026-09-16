@@ -49,7 +49,10 @@ docker compose -f docker-compose-dev.yml exec market-data python -m pytest -q
 ```
 
 - 本服务不再需要 Valkey；funds 编排里的 `funds_valkey` 仍是 C# 侧自己的缓存（单设备登录 Token、集思录/雪球 Token 等），两者互不影响。
-- 与 funds 编排同机协作：funds 侧把 `MarketData__BaseUrl` / `AkShare__BaseUrl` 指向 `http://<本机>:8080`、`PlaywrightGateway__BaseUrl` / `Xueqiu__AuthServiceUrl` 指向 `http://<本机>:8081`；或把两套 compose 的 default 网络统一成同一个 external 网络后按容器名直连。
+- 作为 funds 编排的**外部服务**协作（已落地）：本编排的默认网络固定为 `mdh-net`，funds 侧声明 `networks: { mdh-net: { external: true } }` 并把 `funds.webapi` 接入，然后按容器名寻址：
+  `MarketData__BaseUrl` / `AkShare__BaseUrl` = `http://market_data:8080/`，`PlaywrightGateway__BaseUrl` / `Xueqiu__AuthServiceUrl` = `http://browser_proxy_gateway:8081`。
+  启动顺序固定为**先 hub 后 funds**（`mdh-net` 由本编排创建）；funds 侧不再 build 本仓库，因此不需要子模块。
+  宿主机裸跑/不共网时的替代方案：funds 侧改指 `http://<本机>:8080` 与 `http://<本机>:8081`。
 
 单服务镜像仍可单独构建（build context 即各服务目录）：
 

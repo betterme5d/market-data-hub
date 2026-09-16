@@ -6,6 +6,9 @@ name: market-data-hub
 # 用法：cp .env.example .env 后 docker compose -f docker-compose-dev.yml up -d --build
 # 测试：docker compose -f docker-compose-dev.yml exec market-data python -m pytest -q
 #   （requirements.txt 里已装 pytest / pytest-asyncio，容器本身就是测试环境）
+#
+# 与 funds 协作：默认网络固定名 mdh-net（与 docker-compose.yml 一致），funds 侧以 external 引用，
+# 因此本编排可单独长跑，专门当作 funds 的「第三方行情服务」；先起本编排再起 funds。
 
 # 定义日志配置锚点
 x-logging: &logging-config
@@ -98,3 +101,8 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+# 与生产编排同名共享网络：funds 侧 docker-compose.yml / docker-compose-dev.yml 以 external 引用
+networks:
+  default:
+    name: mdh-net

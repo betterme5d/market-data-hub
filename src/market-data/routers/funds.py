@@ -2,6 +2,7 @@
 """
 基金数据端点：持仓 / 基本信息 / 东财估值 / 交易所基金列表 / 统一净值。
 """
+
 import asyncio
 import logging
 from typing import List
@@ -46,7 +47,7 @@ _NAV_PROVIDERS: dict[str, FundNavSource] = {
 @router.get("/fund/{symbol}/portfolio", tags=["基金数据"], summary="获取基金持仓结构")
 async def get_fund_portfolio(
     symbol: str = Path(..., description="基金代码，如 510300"),
-    year: int = Query(..., description="查询的报告年份，如 2024")
+    year: int = Query(..., description="查询的报告年份，如 2024"),
 ):
     """
     获取单只公募基金在特定年份的重仓股票及持仓比重等数据。
@@ -59,9 +60,7 @@ async def get_fund_portfolio(
 
 
 @router.get("/fund/{symbol}/info", tags=["基金数据"], summary="获取基金基本信息")
-async def get_fund_info(
-    symbol: str = Path(..., description="基金代码")
-):
+async def get_fund_info(symbol: str = Path(..., description="基金代码")):
     """
     获取单只公募基金的名称、管理费率、托管费率、成立时间等基本概况。
     """
@@ -74,10 +73,21 @@ async def get_fund_info(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/api/v1/funds/dates", tags=["基金数据"], summary="获取基金关键日期汇总（成立/上市日期，批量采集）")
-@router.get("/api/v1/funds/profiles", tags=["基金数据"], summary="获取基金关键日期汇总（旧接口别名，兼容用）", deprecated=True)
+@router.get(
+    "/api/v1/funds/dates",
+    tags=["基金数据"],
+    summary="获取基金关键日期汇总（成立/上市日期，批量采集）",
+)
+@router.get(
+    "/api/v1/funds/profiles",
+    tags=["基金数据"],
+    summary="获取基金关键日期汇总（旧接口别名，兼容用）",
+    deprecated=True,
+)
 async def get_fund_dates_batch(
-    refresh: bool = Query(False, description="true 时强制重新拉取上游并覆盖本地文件缓存"),
+    refresh: bool = Query(
+        False, description="true 时强制重新拉取上游并覆盖本地文件缓存"
+    ),
 ):
     """
     合并东财场内基金（成立日期）与沪深交易所列表（上市日期）的全量基金关键日期。
@@ -96,7 +106,11 @@ async def get_fund_dates_batch(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/api/v1/funds/{code}/dates", tags=["基金数据"], summary="获取单只基金关键日期汇总（成立/上市日期）")
+@router.get(
+    "/api/v1/funds/{code}/dates",
+    tags=["基金数据"],
+    summary="获取单只基金关键日期汇总（成立/上市日期）",
+)
 async def get_single_fund_dates(code: str = Path(..., description="基金代码（6 位）")):
     """
     获取单只基金的成立日期与上市日期汇总。
@@ -112,10 +126,13 @@ async def get_single_fund_dates(code: str = Path(..., description="基金代码�
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/fund/{symbol}/profile", tags=["基金数据"], summary="获取单只基金档案（旧接口别名，兼容用）", deprecated=True)
-async def get_fund_profile(
-    symbol: str = Path(..., description="基金代码，如 161724")
-):
+@router.get(
+    "/fund/{symbol}/profile",
+    tags=["基金数据"],
+    summary="获取单只基金档案（旧接口别名，兼容用）",
+    deprecated=True,
+)
+async def get_fund_profile(symbol: str = Path(..., description="基金代码，如 161724")):
     """
     从东财 F10 基本概况页解析单只基金的成立日期，供批量档案覆盖不到的基金兜底。
     """
@@ -126,10 +143,17 @@ async def get_fund_profile(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/api/v1/funds/establish-dates", tags=["基金数据"], summary="获取沪深基金成立日期")
+@router.get(
+    "/api/v1/funds/establish-dates", tags=["基金数据"], summary="获取沪深基金成立日期"
+)
 async def get_establish_dates(
-    category: str | None = Query(None, description="分类：fb (场内ETF/封闭) | kf (开放式/LOF) | all (缺省合并两者)"),
-    refresh: bool = Query(False, description="true 时强制重新拉取上游并覆盖本地文件缓存"),
+    category: str | None = Query(
+        None,
+        description="分类：fb (场内ETF/封闭) | kf (开放式/LOF) | all (缺省合并两者)",
+    ),
+    refresh: bool = Query(
+        False, description="true 时强制重新拉取上游并覆盖本地文件缓存"
+    ),
 ):
     """
     返回在证券交易所上市的沪深基金（ETF、LOF、REITs、封闭式基金）成立日期。
@@ -155,7 +179,11 @@ async def get_establish_dates(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/api/v1/funds/establish-date/{code}", tags=["基金数据"], summary="获取单只基金成立日期")
+@router.get(
+    "/api/v1/funds/establish-date/{code}",
+    tags=["基金数据"],
+    summary="获取单只基金成立日期",
+)
 async def get_establish_date(code: str = Path(..., description="基金代码（6 位）")):
     """
     获取单只基金成立日期（仅支持交易所上市 ETF/LOF/REITs 基金）。
@@ -173,12 +201,20 @@ async def get_establish_date(code: str = Path(..., description="基金代码（6
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/api/v1/funds/delist", tags=["基金数据"], summary="获取沪深场内基金终止上市信息")
+@router.get(
+    "/api/v1/funds/delist", tags=["基金数据"], summary="获取沪深场内基金终止上市信息"
+)
 async def get_fund_delist(
-    start_date: str = Query(default=None, description="公告起始日 YYYY-MM-DD；留空=全量"),
+    start_date: str = Query(
+        default=None, description="公告起始日 YYYY-MM-DD；留空=全量"
+    ),
     end_date: str = Query(default=None, description="公告截止日 YYYY-MM-DD；留空=全量"),
-    limit: int = Query(default=None, ge=1, le=500,
-                       description="最多处理多少只；沪市每只需下载一份 PDF，留空=全部"),
+    limit: int = Query(
+        default=None,
+        ge=1,
+        le=500,
+        description="最多处理多少只；沪市每只需下载一份 PDF，留空=全部",
+    ),
 ):
     """抓取沪深交易所公告，解析场内基金的终止上市日。
 
@@ -190,15 +226,19 @@ async def get_fund_delist(
     """
     try:
         records = await delist_provider.collect(
-            start_date=start_date, end_date=end_date, limit=limit)
+            start_date=start_date, end_date=end_date, limit=limit
+        )
         return [r.to_dict() for r in records]
     except Exception as e:
         logger.error(f"Failed to collect fund delist: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/api/v1/funds/delist/{code}", tags=["基金数据"],
-            summary="按代码查询终止上市信息（没有则返回空）")
+@router.get(
+    "/api/v1/funds/delist/{code}",
+    tags=["基金数据"],
+    summary="按代码查询终止上市信息（没有则返回空）",
+)
 async def get_fund_delist_by_code(
     code: str = Path(..., min_length=6, max_length=6, description="6 位基金代码"),
 ):
@@ -225,8 +265,11 @@ async def get_fund_delist_by_code(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/api/v1/funds/delist/incremental", tags=["基金数据"],
-            summary="增量获取疑似退市（列表差集定位 + 公告确认）")
+@router.get(
+    "/api/v1/funds/delist/incremental",
+    tags=["基金数据"],
+    summary="增量获取疑似退市（列表差集定位 + 公告确认）",
+)
 async def get_fund_delist_incremental():
     """日常增量入口：先用交易所列表差集定位候选，再查这些代码的公告确认。
 
@@ -243,7 +286,7 @@ async def get_fund_delist_incremental():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/api/v1/exchange/funds", tags=["基金数据"], summary="获取上交所和深交所ETF/LOF列表")
+@router.get("/api/v1/exchange/funds", tags=["基金数据"], summary="获取ETF/LOF列表")
 async def get_exchange_funds():
     """
     抓取并解析上交所和深交所的最新 ETF 和 LOF 基金列表。
@@ -256,7 +299,11 @@ async def get_exchange_funds():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/api/v1/exchange/funds/{exchange}", tags=["基金数据"], summary="获取指定交易所ETF/LOF列表")
+@router.get(
+    "/api/v1/exchange/funds/{exchange}",
+    tags=["基金数据"],
+    summary="获取ETF/LOF列表(交易所)",
+)
 async def get_exchange_funds_by(exchange: str):
     """
     抓取指定交易所（SH | SZ）的最新 ETF 和 LOF 基金列表。
@@ -270,7 +317,11 @@ async def get_exchange_funds_by(exchange: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/api/v1/exchange/listing-dates", tags=["基金数据"], summary="获取沪深全部基金上市日期")
+@router.get(
+    "/api/v1/exchange/listing-dates",
+    tags=["基金数据"],
+    summary="获取场内基金上市日期",
+)
 async def get_listing_dates(
     exchange: str | None = Query(None, description="交易所：SH | SZ；缺省返回沪深合并"),
     refresh: bool = Query(False, description="true 时强制重新拉取上游并覆盖文件缓存"),
@@ -279,6 +330,7 @@ async def get_listing_dates(
     返回沪深交易所全部基金上市日期。
 
     上交所页面引用：https://www.sse.com.cn/assortment/fund/list/
+
     深交所页面引用：https://www.szse.cn/market/product/list/all/index.html
 
     采用本地文件缓存（data/ 目录），文件 mtime 超过一天会自动重新全量拉取；
@@ -293,7 +345,11 @@ async def get_listing_dates(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/api/v1/exchange/listing-date/{code}", tags=["基金数据"], summary="获取指定基金上市日期")
+@router.get(
+    "/api/v1/exchange/listing-date/{code}",
+    tags=["基金数据"],
+    summary="获取场内基金上市日期(单基金)",
+)
 async def get_listing_date(code: str = Path(..., description="基金代码（6 位）")):
     """
     获取单只基金上市日期。按代码首字路由交易所：5 开头→上交所，1 开头→深交所。
@@ -316,7 +372,7 @@ async def get_listing_date(code: str = Path(..., description="基金代码（6 �
     "/api/v1/funds/{code}/navs",
     response_model=FundNavResponse,
     tags=["基金数据"],
-    summary="获取指定基金历史净值（带时序增量缓存）",
+    summary="获取基金历史净值",
 )
 async def get_fund_navs(
     code: str = Path(..., description="基金代码（6 位数字）"),
@@ -326,8 +382,12 @@ async def get_fund_navs(
     refresh: bool = Query(
         False, description="true 时忽略已有缓存区间，强制重取上游并回写缓存（方案A）"
     ),
-    header_source: str | None = Header(None, alias="source", description="Header 透传数据源"),
-    x_source: str | None = Header(None, alias="x-source", description="Header 透传数据源 (X-Source)"),
+    header_source: str | None = Header(
+        None, alias="source", description="Header 透传数据源"
+    ),
+    x_source: str | None = Header(
+        None, alias="x-source", description="Header 透传数据源 (X-Source)"
+    ),
     request: Request = None,
 ):
     """
@@ -349,17 +409,23 @@ async def get_fund_navs(
     resolved_source = (raw_source or "eastmoney").strip().lower()
 
     if not (len(clean_code) == 6 and clean_code.isdigit()):
-        raise HTTPException(status_code=400, detail=f"Invalid fund code: {code}, must be 6 digits")
+        raise HTTPException(
+            status_code=400, detail=f"Invalid fund code: {code}, must be 6 digits"
+        )
 
     if s_date > e_date:
         raise HTTPException(
             status_code=400,
-            detail=f"start_date ({s_date}) cannot be after end_date ({e_date})"
+            detail=f"start_date ({s_date}) cannot be after end_date ({e_date})",
         )
 
     try:
         items = await fund_nav_provider.get_fund_nav_history(
-            clean_code, start_date=s_date, end_date=e_date, source=resolved_source, force=refresh
+            clean_code,
+            start_date=s_date,
+            end_date=e_date,
+            source=resolved_source,
+            force=refresh,
         )
         return FundNavResponse(source=resolved_source, count=len(items), items=items)
     except ValueError as ve:
@@ -369,7 +435,7 @@ async def get_fund_navs(
         raise HTTPException(status_code=502, detail=f"Get fund navs failed: {e}")
 
 
-@router.get("/api/fund-nav/latest", tags=["基金数据"], summary="获取最新一期全量基金净值")
+@router.get("/api/fund-nav/latest", tags=["基金数据"], summary="获取基金最新净值")
 async def get_latest_all_nav(
     source: str = Query(..., description="数据源：cmtidp | eastmoney")
 ):
@@ -379,7 +445,9 @@ async def get_latest_all_nav(
     """
     try:
         items = await fund_nav_provider.get_latest_all_nav(source=source)
-        return FundNavResponse(source=source.strip().lower(), count=len(items), items=items)
+        return FundNavResponse(
+            source=source.strip().lower(), count=len(items), items=items
+        )
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
@@ -407,7 +475,7 @@ async def get_fund_nav_history(
     if not start_date or not end_date:
         raise HTTPException(
             status_code=400,
-            detail="Both start_date and end_date are required in YYYY-MM-DD format to prevent unbounded pagination."
+            detail="Both start_date and end_date are required in YYYY-MM-DD format to prevent unbounded pagination.",
         )
     return await get_fund_navs(
         code=code, start_date=start_date, end_date=end_date, source=source
@@ -418,14 +486,15 @@ async def get_fund_nav_history(
     "/api/v1/funds/{code}/shares",
     response_model=FundShareResponse,
     tags=["基金数据"],
-    summary="获取指定基金历史份额（深交所全市场扇出时序缓存）",
+    summary="获取基金历史份额",
 )
 async def get_fund_shares(
     code: str = Path(..., description="基金代码（深市以 1 开头的 6 位代码）"),
     start_date: str = Query(..., description="起始日期 (YYYY-MM-DD)"),
     end_date: str = Query(..., description="结束日期 (YYYY-MM-DD)"),
     refresh: bool = Query(
-        False, description="true 时忽略已有缓存区间，强制重取全市场并回写缓存（方案A，代价高）"
+        False,
+        description="true 时忽略已有缓存区间，强制重取全市场并回写缓存（方案A，代价高）",
     ),
 ):
     """
@@ -437,12 +506,14 @@ async def get_fund_shares(
     e_date = end_date.strip()
 
     if not (len(clean_code) == 6 and clean_code.isdigit()):
-        raise HTTPException(status_code=400, detail=f"Invalid fund code: {code}, must be 6 digits")
+        raise HTTPException(
+            status_code=400, detail=f"Invalid fund code: {code}, must be 6 digits"
+        )
 
     if not (clean_code.startswith("1") or clean_code.startswith("5")):
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid fund code: {code}, must be 6 digits starting with '1' (SZSE) or '5' (SSE)"
+            detail=f"Invalid fund code: {code}, must be 6 digits starting with '1' (SZSE) or '5' (SSE)",
         )
 
     resolved_exchange = "sse" if clean_code.startswith("5") else "szse"
@@ -450,7 +521,7 @@ async def get_fund_shares(
     if s_date > e_date:
         raise HTTPException(
             status_code=400,
-            detail=f"start_date ({s_date}) cannot be after end_date ({e_date})"
+            detail=f"start_date ({s_date}) cannot be after end_date ({e_date})",
         )
 
     try:
@@ -464,9 +535,14 @@ async def get_fund_shares(
             force=refresh,
         )
         return FundShareResponse(
-            code=clean_code, exchange=resolved_exchange, count=len(items), items=items,
+            code=clean_code,
+            exchange=resolved_exchange,
+            count=len(items),
+            items=items,
             incomplete_days=sorted(set(incomplete)),
         )
     except Exception as e:
-        logger.exception(f"Failed to get fund shares for {clean_code} ({s_date} ~ {e_date}): {e}")
+        logger.exception(
+            f"Failed to get fund shares for {clean_code} ({s_date} ~ {e_date}): {e}"
+        )
         raise HTTPException(status_code=502, detail=f"Get fund shares failed: {e}")

@@ -7,6 +7,10 @@ name: market-data-hub
 #
 # 无外部中间件依赖：缓存是进程内实现（内存 + data/state/*.json），见 core/state_store.py。
 #
+# 与 funds 编排协作：本编排的默认网络固定名为 mdh-net，funds 侧把它声明成 external 网络后，
+# 按容器名寻址（market_data:8080 / browser_proxy_gateway:8081）；funds 不再构建本仓库镜像。
+# 启动顺序：本编排先起（mdh-net 由本编排创建），否则 funds 侧 up 会报 network mdh-net not found。
+#
 # 启动：docker compose up -d --build
 # 需要改代码即时生效时改用 docker-compose-dev.yml（源码挂载 + uvicorn --reload）
 
@@ -106,3 +110,10 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+# 供 funds 编排以 external 方式共享的网络：
+#   funds 侧 docker-compose.yml:  networks: { mdh-net: { external: true } }
+# 网络归本编排所有（down 时若 funds 容器仍挂在网内，Docker 会保留该网络）。
+networks:
+  default:
+    name: mdh-net
