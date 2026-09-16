@@ -6,7 +6,7 @@
 - 上交所 SSE：SseFundListSource（commonSoaQuery，JSON，原生态 listingDate）
 - 深交所 SZSE：SzseFundListSource（ShowReport CATALOGID=1105，xlsx，全量 ETF/LOF/REITs）
 
-缓存策略：上市日期近乎静态、访问低频，不做内存常驻（Valkey），改为
+缓存策略：上市日期近乎静态、访问低频，不常驻进程内存，改为
 按交易所本地 JSON 文件落盘（data/ 目录）。全量接口校验文件 mtime，超过一天
 重新全量拉取并覆盖写；单只接口先查进程内存 → 再查文件，均未命中才打上游。
 """

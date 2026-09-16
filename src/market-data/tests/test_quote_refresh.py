@@ -1,51 +1,17 @@
 # -*- coding: utf-8 -*-
-"""行情接口 refresh=true（方案A）：跳过缓存读取，但仍把上游结果回写缓存。"""
+"""行情接口 refresh=true（方案A）：跳过缓存读取，但仍把上游结果回写缓存。
+
+缓存已从 Valkey 改为进程内实现（core/state_store.py），这里直接用真实存储断言，
+不再用 FakeRedis 替身——断言的 TTL/读写次数就是生产路径的行为。
+"""
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from core.cache import quote_cache
 from core.dispatcher import QuoteDispatcher, get_quote_cache_key
 from core.models import UnifiedQuote
-
-
-class _FakeRedis:
-    """最小 Redis 替身：只实现 dispatcher 用得到的方法，并记录读写次数。"""
-
-    def __init__(self, initial=None):
-        self.store = dict(initial or {})
-        self.get_calls = 0
-        self.setex_calls = 0
-        self.setex_args = []  # [(key, ttl), ...]
-
-    def get(self, key):
-        self.get_calls += 1
-        return self.store.get(key)
-
-    def setex(self, key, ttl, value):
-        self.setex_calls += 1
-        self.setex_args.append((key, ttl))
-        self.store[key] = value
-
-    def exists(self, key):
-        return 1 if key in self.store else 0
-
-    def incr(self, key):
-        self.store[key] = str(int(self.store.get(key, 0)) + 1)
-        return int(self.store[key])
-
-    def expire(self, key, ttl):
-        return True
-
-    def delete(self, key):
-        self.store.pop(key, None)
-        return 1
-
-    def mget(self, keys):
-        return [self.store.get(k) for k in keys]
-
-    def ttl(self, key):
-        return 60
 
 
 @pytest.mark.asyncio
@@ -53,14 +19,14 @@ async def test_quote_refresh_bypasses_cache_read_but_still_writes():
     """refresh=True：不读缓存直接打上游；refresh=False：命中缓存不调上游。"""
     cached = UnifiedQuote(symbol="510300", name="缓存值", price=1.0, date="2026-09-11", source="sina")
     fresh = UnifiedQuote(symbol="510300", name="上游值", price=2.0, date="2026-09-11", source="sina")
-    fake = _FakeRedis({get_quote_cache_key("510300"): cached.model_dump_json()})
+    quote_cache.setex(get_quote_cache_key("510300"), 10, cached.model_dump_json())
+    reads_before = quote_cache.stats()["reads"]
 
     provider = MagicMock()
     provider.get_quote = AsyncMock(return_value=(fresh, 10))
 
-    with patch("core.dispatcher.redis_client", fake), patch.dict(
-        "core.dispatcher.PROVIDERS", {"sina": provider}, clear=False
-    ), patch.dict("core.dispatcher.SEMAPHORES", {"sina": asyncio.Semaphore(1)}, clear=False):
+    with patch.dict("core.dispatcher.PROVIDERS", {"sina": provider}, clear=False), \
+         patch.dict("core.dispatcher.SEMAPHORES", {"sina": asyncio.Semaphore(1)}, clear=False):
         hit = await QuoteDispatcher.get_quote_with_fallback("510300", {"sina": "sh510300"})
         assert hit.name == "缓存值"
         assert provider.get_quote.call_count == 0
@@ -71,8 +37,9 @@ async def test_quote_refresh_bypasses_cache_read_but_still_writes():
         assert got.name == "上游值"
         assert provider.get_quote.call_count == 1
 
-    assert fake.get_calls == 1, "refresh=True 不应再读缓存"
-    assert fake.setex_calls >= 1, "方案A：刷新结果要回写缓存"
+    assert quote_cache.stats()["reads"] - reads_before == 1, "refresh=True 不应再读缓存"
+    written = UnifiedQuote.model_validate_json(quote_cache.get(get_quote_cache_key("510300")))
+    assert written.name == "上游值", "方案A：刷新结果要回写缓存"
 
 
 @pytest.mark.asyncio
@@ -84,13 +51,12 @@ async def test_single_cache_hit_rejected_when_source_not_allowed():
     fresh = UnifiedQuote(
         symbol="510300", name="tencent上游", price=2.0, date="2026-09-11", source="tencent"
     )
-    fake = _FakeRedis({get_quote_cache_key("510300"): cached.model_dump_json()})
+    quote_cache.setex(get_quote_cache_key("510300"), 10, cached.model_dump_json())
     provider = MagicMock()
     provider.get_quote = AsyncMock(return_value=(fresh, 10))
 
-    with patch("core.dispatcher.redis_client", fake), patch.dict(
-        "core.dispatcher.PROVIDERS", {"tencent": provider}, clear=False
-    ), patch.dict("core.dispatcher.SEMAPHORES", {"tencent": asyncio.Semaphore(1)}, clear=False):
+    with patch.dict("core.dispatcher.PROVIDERS", {"tencent": provider}, clear=False), \
+         patch.dict("core.dispatcher.SEMAPHORES", {"tencent": asyncio.Semaphore(1)}, clear=False):
         got = await QuoteDispatcher.get_quote_with_fallback("510300", {"tencent": "sh510300"})
 
     assert got.name == "tencent上游"
@@ -100,17 +66,30 @@ async def test_single_cache_hit_rejected_when_source_not_allowed():
 @pytest.mark.asyncio
 async def test_batch_cache_write_uses_source_ttl():
     """批量写缓存必须按源取 TTL：yfinance 不能沿用写死的 10 秒。"""
-    fake = _FakeRedis()
     quote = UnifiedQuote(
         symbol="AAPL", name="上游值", price=200.0, date="2026-09-11", source="yfinance"
     )
     provider = MagicMock()
     provider.get_quotes = AsyncMock(return_value={"AAPL": quote})
 
-    with patch("core.dispatcher.redis_client", fake), patch.dict(
-        "core.dispatcher.PROVIDERS", {"yfinance": provider}, clear=False
-    ), patch.dict("core.dispatcher.SEMAPHORES", {"yfinance": asyncio.Semaphore(1)}, clear=False):
-        await QuoteDispatcher.get_quotes_batch([{"symbol": "AAPL", "allowed_sources": {"yfinance": "AAPL"}}])
+    with patch.dict("core.dispatcher.PROVIDERS", {"yfinance": provider}, clear=False), \
+         patch.dict("core.dispatcher.SEMAPHORES", {"yfinance": asyncio.Semaphore(1)}, clear=False):
+        await QuoteDispatcher.get_quotes_batch(
+            [{"symbol": "AAPL", "allowed_sources": {"yfinance": "AAPL"}}]
+        )
 
-    assert fake.setex_args, "必须写入缓存"
-    assert fake.setex_args[-1][1] >= 600, fake.setex_args
+    ttl = quote_cache.ttl(get_quote_cache_key("AAPL"))
+    assert ttl >= 590, f"批量路径必须沿用源级默认 TTL（yfinance 600s），实际 {ttl}"
+
+
+@pytest.mark.asyncio
+async def test_quote_cache_is_memory_only_and_expires():
+    """报价短路缓存是纯内存的：不落文件，且 TTL 到期即失效。"""
+    import time as _time
+
+    quote_cache.setex(get_quote_cache_key("SH600000"), 1, "{}")
+    assert quote_cache.ttl(get_quote_cache_key("SH600000")) == 1
+    _time.sleep(1.1)
+    assert quote_cache.get(get_quote_cache_key("SH600000")) is None, "过期后必须读不到"
+    assert quote_cache.persist is False, "10 秒级报价数据不应落盘"
+    assert quote_cache.path.exists() is False, "内存存储不应产生状态文件"

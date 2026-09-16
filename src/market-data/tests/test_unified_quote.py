@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import sys
 import os
 import pytest
@@ -188,15 +188,10 @@ async def test_history_feature():
 async def test_circuit_breaker_immunity():
     print("=== [8] 测试业务异常下的熔断免疫 (Circuit Breaker Immunity) ===")
     
-    # 强制重置新浪源状态，清除可能残留的失败计数或隔离
-    from core.cache import redis_client
-    if redis_client:
-        try:
-            from core.dispatcher import get_blocked_key, get_failure_key
-            redis_client.delete(get_blocked_key("sina"))
-            redis_client.delete(get_failure_key("sina"))
-        except Exception:
-            pass
+    # 强制重置新浪源状态，清除可能残留的失败计数或隔离（缓存已改为进程内实现）
+    from core.cache import breaker_store
+    from core.dispatcher import get_blocked_key, get_failure_key
+    breaker_store.delete(get_blocked_key("sina"), get_failure_key("sina"))
             
     # 1. 模拟客户端发起连续 3 次对非法期货代码的查询
     allowed = {"sina": "nf_INVALID999"}
@@ -247,11 +242,7 @@ async def test_sources_status():
 
 async def test_manual_unblock():
     print("=== [10] 测试手动解封行情源接口 ===")
-    from core.cache import redis_client
-    if not redis_client:
-        print("  Valkey 缓存不可用，跳过手动解封集成测试。")
-        print()
-        return
+    # 缓存已改为进程内实现，恒可用，无需按可用性跳过
         
     from routers.health import unblock_source
     

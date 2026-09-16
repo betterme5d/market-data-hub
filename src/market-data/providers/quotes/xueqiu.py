@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import time
 import logging
 import os
@@ -171,7 +171,8 @@ class XueqiuProvider(BaseProvider):
         if self._cookie and time.time() < self._cookie_expiry:
             return self._cookie, self._user_agent
 
-        # 0. 共享缓存（Valkey）：跨实例/跨进程复用，避免每次缓存未命中都经网关重取 Cookie
+        # 0. 内部缓存（进程内 + 落文件 data/state/xueqiu_auth.json）：
+        #    避免每次缓存未命中都经网关重取 Cookie，重启后也能直接复用
         shared = cache_store.get_xueqiu_auth()
         if shared:
             self._cookie = shared["cookie"]

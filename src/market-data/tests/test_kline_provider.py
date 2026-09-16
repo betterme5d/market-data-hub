@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Task 123: KLineProvider 业务门面单元测试 — 严格验证多维 Parquet 物理隔离"""
 import pytest
 from unittest.mock import AsyncMock, patch
@@ -204,9 +204,7 @@ async def test_kline_guard_excludes_business_exception_from_failures(monkeypatch
         lambda source, ok, latency_ms, via="business", error=None: calls.append((source, ok, via)),
     )
 
-    # 与本次修复无关：避免在无 Valkey/DNS 的环境里等连接超时（is_source_blocked 会连 valkey）
-    from core.dispatcher import QuoteDispatcher
-    monkeypatch.setattr(QuoteDispatcher, "is_source_blocked", staticmethod(lambda source: False))
+
 
     with pytest.raises(BusinessException):
         async with xq_mod.kline_guard():
@@ -228,9 +226,7 @@ async def test_kline_guard_counts_system_exception_as_failure(monkeypatch):
         lambda source, ok, latency_ms, via="business", error=None: calls.append((source, ok, via)),
     )
 
-    # 与本次修复无关：避免在无 Valkey/DNS 的环境里等连接超时（is_source_blocked 会连 valkey）
-    from core.dispatcher import QuoteDispatcher
-    monkeypatch.setattr(QuoteDispatcher, "is_source_blocked", staticmethod(lambda source: False))
+
 
     with pytest.raises(RuntimeError):
         async with xq_mod.kline_guard():
@@ -241,7 +237,7 @@ async def test_kline_guard_counts_system_exception_as_failure(monkeypatch):
 @pytest.mark.asyncio
 async def test_kline_provider_reuses_single_xueqiu_instance(tmp, monkeypatch):
     """D13：XueqiuProvider 必须复用同一实例，否则实例级 Cookie 缓存（10 分钟）形同虚设，
-    每次 K 线请求都可能重新走一次鉴权网关（Valkey 不可用时更明显）。"""
+    每次 K 线请求都可能重新走一次鉴权网关。"""
     import contextlib
 
     from providers.quotes import xueqiu as xq_mod

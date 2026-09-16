@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 健康与数据源监控端点：
-- /health                     服务存活 + Valkey 连接
+- /health                     服务存活 + 进程内缓存层快照（无外部依赖）
 - /health/sources             逐源健康面板（被动指标 + 状态）
 - /health/sources/{name}/probe 手动触发单源主动探测
 - /api/sources/status         行情源熔断指标（与原有契约一致）
@@ -11,8 +11,8 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Query
 
+from core import cache as cache_mod
 from core import health as health_svc
-from core.cache import redis_client
 from core.dispatcher import QuoteDispatcher, PROVIDERS
 
 logger = logging.getLogger(__name__)
@@ -23,9 +23,12 @@ router = APIRouter()
 @router.get("/health", tags=["系统监控"], summary="服务健康检查")
 async def health():
     """
-    检查服务及其依赖组件（如 Valkey 缓存数据库）的连接状态。
+    服务存活检查 + 缓存层快照。
+
+    缓存已改为进程内实现（见 core/state_store.py），不再有外部依赖，
+    因此 status 恒为 ok；cache 段落用于观察各存储的条目数与读写计数。
     """
-    return {"status": "ok", "valkey": "connected" if redis_client else "disconnected"}
+    return {"status": "ok", "cache": cache_mod.describe()}
 
 
 @router.get("/health/sources", tags=["系统监控"], summary="逐数据源健康面板（状态+被动指标）")
@@ -63,7 +66,7 @@ async def unblock_source(
     source: str = Query(..., description="要解封的行情源，如 sina, tencent, xueqiu, yfinance")
 ):
     """
-    手动清除指定行情源在 Valkey 中的熔断冷却与失败计次，强制其立即重新启用。
+    手动清除指定行情源的熔断冷却与失败计次，强制其立即重新启用。
     """
     source_lower = source.lower()
     if source_lower not in PROVIDERS:
@@ -77,14 +80,10 @@ async def unblock_source(
 
 @router.get("/quote/unblock-all", tags=["调试与维护"], summary="一键清除所有数据源的熔断状态")
 async def unblock_all_sources():
-    if not redis_client:
-        return {"status": "error", "message": "Valkey/Redis 缓存未连接"}
-    try:
-        from core.dispatcher import get_blocked_key
-        cleared = []
-        for src in PROVIDERS.keys():
-            if redis_client.delete(get_blocked_key(src)) > 0:
-                cleared.append(src)
-        return {"status": "ok", "cleared_sources": cleared}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    from core.dispatcher import get_blocked_key
+
+    cleared = []
+    for src in PROVIDERS.keys():
+        if cache_mod.breaker_store.delete(get_blocked_key(src)) > 0:
+            cleared.append(src)
+    return {"status": "ok", "cleared_sources": cleared}

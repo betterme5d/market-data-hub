@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """D12：K 线缓存口径统一（不迁移存量）。
 
 背景：同一个 "kline" 命名空间原本有两套口径——
@@ -15,7 +15,6 @@ from unittest.mock import patch
 
 import pytest
 
-from core.dispatcher import QuoteDispatcher
 from core.timeseries_cache.manager import TimeSeriesCacheManager
 from providers.quotes.kline_provider import KLineProvider
 from providers.quotes.xueqiu import XueqiuProvider
@@ -33,12 +32,6 @@ BAR = {
     "turnover_rate": 0.0,
 }
 
-
-@pytest.fixture(autouse=True)
-def _disable_breaker_lookup():
-    """kline_guard 会连 Valkey 判熔断（无 Valkey 时等 DNS 超时），本用例只关心缓存口径。"""
-    with patch.object(QuoteDispatcher, "is_source_blocked", staticmethod(lambda source: False)):
-        yield
 
 
 @pytest.mark.asyncio

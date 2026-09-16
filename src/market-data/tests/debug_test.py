@@ -23,7 +23,7 @@ def load_env_dev():
 load_env_dev()
 
 # 2. 导入 main 中的接口函数
-# 注意：导入时 main.py 会执行全局变量初始化（如连接 Redis）
+# 注意：导入时 main.py 会执行全局变量初始化（探针注册、后台探测循环等）
 from routers.quotes import get_quote, get_history
 from routers.health import health
 

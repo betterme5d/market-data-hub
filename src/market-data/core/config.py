@@ -27,10 +27,10 @@ def _get_float(key: str, default: float) -> float:
 # ---------- 日志 ----------
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
-# ---------- Valkey ----------
-VALKEY_HOST = _get("VALKEY_HOST", "valkey")
-VALKEY_PORT = _get_int("VALKEY_PORT", 6380)
-VALKEY_PASSWORD = _get("VALKEY_PASSWORD", "")
+# ---------- 进程内状态缓存 ----------
+# 状态文件目录（熔断状态 / 雪球 Cookie / yfinance 复权锚点）；
+# 报价短路缓存是纯内存的，不落盘，分层依据见 core/state_store.py
+STATE_DIR = _get("STATE_DIR", "data/state")
 
 # ---------- 上游数据源地址 ----------
 CFETS_BASE_URL = _get("CFETS_BASE_URL", "https://www.chinamoney.com.cn")

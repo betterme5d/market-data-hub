@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """雪球证券状态扫描 —— 交易所公告通道的**补充召回**。
 
 为什么需要它
@@ -19,7 +19,7 @@
 ----
 - 用**单只** `v5/stock/quote.json` 而非批量 `realtime/quotec.json`：
   批量接口休市时返回 HTTP 200 + 空载荷，扫不出东西。
-- Cookie 复用 `XueqiuProvider._ensure_cookie()`（网关/直连/兜底三级 + Valkey 共享）。
+- Cookie 复用 `XueqiuProvider._ensure_cookie()`（网关/直连/兜底三级 + 内部缓存共享）。
 """
 from __future__ import annotations
 

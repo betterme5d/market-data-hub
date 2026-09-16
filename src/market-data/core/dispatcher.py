@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 import asyncio
 import time
 import json
@@ -6,7 +6,7 @@ from typing import List, Dict, Any, Tuple, Optional
 from core.exceptions import BusinessException
 
 from core.models import UnifiedQuote
-from core.cache import redis_client
+from core.cache import breaker_store, quote_cache
 from core import health
 from providers.quotes.tencent import TencentProvider
 from providers.quotes.sina import SinaProvider
@@ -81,19 +81,17 @@ class QuoteDispatcher:
         """
         获取指定源的监控指标，包含熔断状态、失败计次及剩余隔离时间
         """
-        if not redis_client:
-            return {"source": source, "status": "healthy", "failures": 0, "blocked_seconds_left": 0}
         try:
             blocked_key = get_blocked_key(source)
             failure_key = get_failure_key(source)
             
-            is_blocked = redis_client.exists(blocked_key) == 1
-            failures_val = redis_client.get(failure_key)
+            is_blocked = breaker_store.exists(blocked_key) == 1
+            failures_val = breaker_store.get(failure_key)
             failures = int(failures_val) if failures_val else 0
             
             blocked_seconds_left = 0
             if is_blocked:
-                ttl = redis_client.ttl(blocked_key)
+                ttl = breaker_store.ttl(blocked_key)
                 blocked_seconds_left = max(0, ttl)
                 
             return {
@@ -111,15 +109,13 @@ class QuoteDispatcher:
         """
         手动将黑名单数据源重新启用（清除隔离状态与失败计次）
         """
-        if not redis_client:
-            return False
         try:
             blocked_key = get_blocked_key(source)
             failure_key = get_failure_key(source)
             
-            # 删除 Redis 对应键以恢复健康
-            redis_client.delete(blocked_key)
-            redis_client.delete(failure_key)
+            # 清除本地熔断冷却与失败计次
+            breaker_store.delete(blocked_key)
+            breaker_store.delete(failure_key)
             logger.warning(f"Manual override: SOURCE '{source}' has been manually unblocked.")
             return True
         except Exception as e:
@@ -131,10 +127,8 @@ class QuoteDispatcher:
         """
         判断某个行情源是否处于熔断冷却期
         """
-        if not redis_client:
-            return False
         try:
-            return redis_client.exists(get_blocked_key(source)) == 1
+            return breaker_store.exists(get_blocked_key(source)) == 1
         except Exception as e:
             logger.warning(f"Check source blocked status failed for {source}: {e}")
             return False
@@ -144,10 +138,8 @@ class QuoteDispatcher:
         """
         强制隔离拉黑某个数据源 (触发熔断)
         """
-        if not redis_client:
-            return
         try:
-            redis_client.setex(get_blocked_key(source), ttl, "1")
+            breaker_store.setex(get_blocked_key(source), ttl, "1")
             logger.warning(f"Circuit breaker triggered: SOURCE '{source}' is blocked for {ttl}s due to cumulative errors.")
         except Exception as e:
             logger.warning(f"Block source {source} failed: {e}")
@@ -157,19 +149,17 @@ class QuoteDispatcher:
         """
         记录一次失败。若在 FAILURE_WINDOW (60s) 内失败累计达到 MAX_FAILURES (3次)，则触发熔断。
         """
-        if not redis_client:
-            return
         try:
             key = get_failure_key(source)
-            count = redis_client.incr(key)
+            count = breaker_store.incr(key)
             if count == 1:
                 # 首次失败，设置滑动过期窗口
-                redis_client.expire(key, FAILURE_WINDOW)
+                breaker_store.expire(key, FAILURE_WINDOW)
             
             if count >= MAX_FAILURES:
                 # 累计达标，正式拉黑
                 QuoteDispatcher.block_source(source)
-                redis_client.delete(key)
+                breaker_store.delete(key)
             else:
                 logger.warning(f"Source '{source}' failure count: {count}/{MAX_FAILURES} within {FAILURE_WINDOW}s.")
         except Exception as e:
@@ -180,10 +170,8 @@ class QuoteDispatcher:
         """
         当行情源成功获取行情时，重置并清空其失败计数器
         """
-        if not redis_client:
-            return
         try:
-            redis_client.delete(get_failure_key(source))
+            breaker_store.delete(get_failure_key(source))
         except Exception as e:
             logger.warning(f"Reset failures for {source} failed: {e}")
 
@@ -194,12 +182,12 @@ class QuoteDispatcher:
         """
         单只行情智能 Fallback 抓取，支持可选的五档深度数据
         """
-        # 1. 尝试读 Valkey 缓存 (仅在不带深度数据时使用缓存)
+        # 1. 尝试读本地缓存 (仅在不带深度数据时使用缓存)
         cache_key = get_quote_cache_key(symbol)
         # refresh=True（方案A）：跳过缓存读取，但结果仍会回写
-        if not with_depth and not refresh and redis_client:
+        if not with_depth and not refresh:
             try:
-                cached = redis_client.get(cache_key)
+                cached = quote_cache.get(cache_key)
                 if cached:
                     cached_quote = UnifiedQuote.model_validate_json(cached)
                     if _source_allowed(cached_quote.source, allowed_sources):
@@ -235,10 +223,10 @@ class QuoteDispatcher:
                     result_model.symbol = symbol
                     
                     # 3. 写入缓存并返回 (仅在不带深度数据时缓存)
-                    if not with_depth and redis_client:
+                    if not with_depth:
                         try:
-                            redis_client.setex(cache_key, ttl or DEFAULT_CACHE_TTL, result_model.model_dump_json())
-                            logger.debug(f"Successfully cached quote for {symbol} to Valkey, ttl={ttl or DEFAULT_CACHE_TTL}")
+                            quote_cache.setex(cache_key, ttl or DEFAULT_CACHE_TTL, result_model.model_dump_json())
+                            logger.debug(f"Successfully cached quote for {symbol} to local cache, ttl={ttl or DEFAULT_CACHE_TTL}")
                         except Exception as c_ex:
                             logger.warning(f"Cache write failed: {c_ex}")
                     
@@ -277,11 +265,11 @@ class QuoteDispatcher:
 
         results_map: Dict[str, UnifiedQuote] = {}
         
-        # 1. 批量批量读 Valkey 缓存 (仅在不带深度数据时使用缓存；refresh=True 时跳过)
-        if not with_depth and not refresh and redis_client:
+        # 1. 批量读本地缓存 (仅在不带深度数据时使用缓存；refresh=True 时跳过)
+        if not with_depth and not refresh:
             try:
                 cache_keys = [get_quote_cache_key(item["symbol"]) for item in items]
-                cached_values = redis_client.mget(cache_keys)
+                cached_values = quote_cache.mget(cache_keys)
                 for item, cached_val in zip(items, cached_values):
                     if not cached_val:
                         continue
@@ -295,7 +283,7 @@ class QuoteDispatcher:
                         )
                         continue
                     results_map[item["symbol"].lower()] = q
-                    logger.debug(f"Valkey cache hit for batch symbol: {item['symbol']}")
+                    logger.debug(f"Local cache hit for batch symbol: {item['symbol']}")
             except Exception as e:
                 logger.warning(f"MGET cache failed: {e}")
 
@@ -429,18 +417,18 @@ class QuoteDispatcher:
                         results_map[std_sym] = q
                         round_success_count += 1
                         
-                        # 仅在不带深度数据时写入 Redis 缓存
-                        if not with_depth and redis_client:
+                        # 仅在不带深度数据时写入本地缓存
+                        if not with_depth:
                             try:
                                 # 优先用 provider 自报的 TTL（yfinance 收盘后是小时级，见 get_market_ttl），
                                 # 批量接口拿不到 TTL 时退回源级默认值
                                 ttl = group_ttl or SOURCE_CACHE_TTL.get(
                                     (q.source or "").lower(), DEFAULT_CACHE_TTL
                                 )
-                                redis_client.setex(
+                                quote_cache.setex(
                                     get_quote_cache_key(std_sym), ttl, q.model_dump_json()
                                 )
-                                logger.debug(f"Successfully cached batch quote for {std_sym} to Valkey, ttl={ttl}")
+                                logger.debug(f"Successfully cached batch quote for {std_sym} to local cache, ttl={ttl}")
                             except Exception:
                                 pass
 

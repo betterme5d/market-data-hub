@@ -1,4 +1,4 @@
-﻿# market-data 架构规范
+# market-data 架构规范
 
 本文件是 `src/market-data` 的结构约定，新增/修改 provider 与 router 时必须遵循。
 
@@ -6,10 +6,10 @@
 
 ```
 main.py              应用装配：日志、FastAPI 创建、路由挂载、探针注册、lifespan
-core/                横切能力（无业务）：config / cache / health / dispatcher /
-                     routing / filters / exceptions / models / calendar /
-                     bar_estimator（K线根数估算）/ timeseries_cache（通用时序
-                     Parquet 增量缓存引擎）
+core/                横切能力（无业务）：config / cache / state_store / health /
+                     dispatcher / routing / filters / exceptions / models /
+                     calendar / bar_estimator（K线根数估算）/ timeseries_cache
+                     （通用时序 Parquet 增量缓存引擎）
 providers/           数据源实现（业务所在），按域分目录：
                      exchanges/ 交易所 · funds/ 基金 · quotes/ 行情 · misc/ 杂项
 routers/             HTTP 薄层：只做参数解析与异常包装，业务一律下沉到 provider
@@ -18,6 +18,17 @@ scripts/ tests/       工具与测试
 ```
 
 约束：routers 不写业务逻辑；providers 不散落 `os.getenv`（统一走 `core.config`）。
+
+缓存分层（**无外部中间件**，原 Valkey 依赖已移除）：
+
+| 层 | 落点 | 承载 | 生命周期 |
+| --- | --- | --- | --- |
+| 进程内存 | `core.state_store.StateStore(persist=False)` | 报价短路缓存（10s / yfinance 600s）、健康指标窗口 | 进程内，重启即失 |
+| 状态文件 | `data/state/*.json`（`persist=True`） | 行情源熔断状态、雪球 Cookie、yfinance 复权锚点 | 跨重启保留 |
+| 时序文件 | `data/cache/**/*.parquet` + `meta.json` | 净值 / K线 / 份额的区间增量缓存 | 跨重启保留 |
+
+选层判据：**数据寿命**决定要不要落盘，**是否有日期维度**决定用 state_store 还是
+timeseries_cache。新增缓存时必须按这两问定位，不要为「统一」而把短 TTL 热数据写文件。
 
 ## 2. 三词命名契约（横跨整个 providers/）
 

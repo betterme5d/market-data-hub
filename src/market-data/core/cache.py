@@ -1,127 +1,132 @@
-﻿import json
+# -*- coding: utf-8 -*-
+"""业务缓存门面：报价 / 后复权锚点 / 雪球鉴权，底层走 core.state_store。
+
+历史沿革：本模块此前是 Valkey 客户端（含惰性连接、跨进程共享）。拆库后按部署形态
+（单容器单进程）改为进程内缓存，见 core/state_store.py 的模块说明。
+
+分层：
+- ``quote_cache``    纯内存。10 秒级 TTL 的报价短路数据，落盘没有意义。
+- ``breaker_store``  落文件。行情源熔断状态（冷却 300 秒 / 失败窗口 60 秒）——
+  重启后重建的代价是「再打一次已知挂掉的上游」，值得保留。
+- ``anchor_store``   落文件。yfinance 后复权锚点几乎不变，重启后重建要拉一次全量历史。
+- ``auth_store``     落文件。雪球鉴权 Cookie（TTL 1 小时），重启后重建要唤醒一次网关。
+"""
+import json
 import logging
 from typing import Optional
 
-import redis
-
-from core import config
+from core.state_store import StateStore
 
 logger = logging.getLogger(__name__)
 
-# 兼容旧引用（配置统一走 core.config）
-REDIS_HOST = config.VALKEY_HOST
-REDIS_PORT = config.VALKEY_PORT
-REDIS_PWD = config.VALKEY_PASSWORD
+# 报价短路缓存（10 秒级）：纯内存
+quote_cache = StateStore("quote_cache")
+# 行情源熔断状态：跨重启保留
+breaker_store = StateStore("quote_breaker", persist=True)
+# yfinance 后复权锚点：跨重启保留
+anchor_store = StateStore("yfinance_anchor", persist=True)
+# 雪球鉴权 Cookie：跨重启保留
+auth_store = StateStore("xueqiu_auth", persist=True)
 
+# 兼容旧引用（原先是 Valkey 的 host/port，现在无外部依赖，保留常量便于排查日志）
+CACHE_BACKEND = "memory"
 
-def _create_client():
-    """创建 Valkey 客户端（惰性连接）。
-
-    刻意**不在导入期 ping**：Valkey 若在进程启动瞬间抖动一次，旧实现会把 redis_client 永久置为 None，
-    导致行情缓存、熔断、健康指标、雪球 Cookie 共享全部失效直到进程重启。
-    redis.Redis 本身是惰性连接（构造不建连），各调用点均已各自 try/except 容错，按调用失败降级即可。
-    """
-    try:
-        return redis.Redis(
-            host=config.VALKEY_HOST,
-            port=config.VALKEY_PORT,
-            password=config.VALKEY_PASSWORD,
-            decode_responses=True,
-            socket_timeout=5,
-            socket_connect_timeout=2,
-        )
-    except Exception as e:
-        logger.error(f"Failed to create Valkey client: {e}")
-        return None
-
-
-redis_client = _create_client()
-
-if redis_client is not None:
-    logger.info(f"Valkey client created for {REDIS_HOST}:{REDIS_PORT} (lazy connect)")
-
-def get_cached_quote(symbol: str, provider: str = "yfinance") -> Optional[dict]:
-    if not redis_client:
-        return None
-    try:
-        key = f"{provider}:quote:{symbol}"
-        data = redis_client.get(key)
-        if data:
-            return json.loads(data)
-    except Exception as e:
-        logger.warning(f"Get cached quote failed for {symbol}: {e}")
-    return None
-
-def set_cached_quote(symbol: str, data: dict, ttl: int, provider: str = "yfinance") -> None:
-    if not redis_client:
-        return
-    try:
-        key = f"{provider}:quote:{symbol}"
-        redis_client.setex(key, ttl, json.dumps(data))
-    except Exception as e:
-        logger.warning(f"Set cached quote failed for {symbol}: {e}")
-
-def get_cached_anchor(symbol: str, provider: str = "yfinance") -> Optional[dict]:
-    if not redis_client:
-        return None
-    try:
-        key = f"{provider}:anchor:{symbol}"
-        data = redis_client.get(key)
-        if data:
-            return json.loads(data)
-    except Exception as e:
-        logger.warning(f"Get cached anchor failed for {symbol}: {e}")
-    return None
-
-def set_cached_anchor(symbol: str, data: dict, provider: str = "yfinance") -> None:
-    if not redis_client:
-        return
-    try:
-        key = f"{provider}:anchor:{symbol}"
-        redis_client.set(key, json.dumps(data))
-    except Exception as e:
-        logger.warning(f"Set cached anchor failed for {symbol}: {e}")
-
-
-# 雪球鉴权 Cookie 的共享缓存：
-# 独立于 C# 的 `xueqiu:cookies`（对方用 NewLife 自有序列化格式，跨语言共用有解析风险），
-# 但目的相同——让 Cookie 跨实例/跨进程复用，避免每次缓存未命中都经 Playwright 网关重取。
+# 雪球鉴权信息在 state_store 中的键（原 Valkey 键名沿用，便于对照历史日志）
 XUEQIU_AUTH_KEY = "xueqiu:auth:marketdata"
 
 
-def get_xueqiu_auth() -> Optional[dict]:
-    """读取共享的雪球鉴权信息，返回 {"cookie": str, "userAgent": str} 或 None。"""
-    if not redis_client:
+def _quote_key(symbol: str, provider: str) -> str:
+    return f"{provider}:quote:{symbol}"
+
+
+def _anchor_key(symbol: str, provider: str) -> str:
+    return f"{provider}:anchor:{symbol}"
+
+
+# ---------------------------------------------------------------------------
+# 报价（供 yfinance 的当日 K 线修补读取；写入方是 dispatcher 自己的键空间）
+# ---------------------------------------------------------------------------
+def get_cached_quote(symbol: str, provider: str = "yfinance") -> Optional[dict]:
+    raw = quote_cache.get(_quote_key(symbol, provider))
+    if not raw:
         return None
     try:
-        data = redis_client.get(XUEQIU_AUTH_KEY)
-        if data:
-            payload = json.loads(data)
-            if payload.get("cookie"):
-                return payload
-    except Exception as e:
-        logger.warning(f"Get shared xueqiu auth failed: {e}")
-    return None
+        return json.loads(raw)
+    except (TypeError, ValueError) as e:
+        logger.warning(f"Get cached quote for {symbol} failed: {e}")
+        return None
+
+
+def set_cached_quote(symbol: str, data: dict, ttl: int, provider: str = "yfinance") -> None:
+    try:
+        quote_cache.setex(_quote_key(symbol, provider), ttl, json.dumps(data))
+    except (TypeError, ValueError) as e:
+        logger.warning(f"Set cached quote for {symbol} failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# yfinance 后复权锚点（永不过期，随文件跨重启保留）
+# ---------------------------------------------------------------------------
+def get_cached_anchor(symbol: str, provider: str = "yfinance") -> Optional[dict]:
+    raw = anchor_store.get(_anchor_key(symbol, provider))
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError) as e:
+        logger.warning(f"Get cached anchor for {symbol} failed: {e}")
+        return None
+
+
+def set_cached_anchor(symbol: str, data: dict, provider: str = "yfinance") -> None:
+    try:
+        anchor_store.set(_anchor_key(symbol, provider), json.dumps(data))
+    except (TypeError, ValueError) as e:
+        logger.warning(f"Set cached anchor for {symbol} failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 雪球鉴权 Cookie
+# ---------------------------------------------------------------------------
+def get_xueqiu_auth() -> Optional[dict]:
+    """读取雪球鉴权信息，返回 {"cookie": str, "userAgent": str} 或 None。"""
+    raw = auth_store.get(XUEQIU_AUTH_KEY)
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError) as e:
+        logger.warning(f"Get cached xueqiu auth failed: {e}")
+        return None
+    return payload if payload.get("cookie") else None
 
 
 def set_xueqiu_auth(cookie: str, user_agent: str, ttl: int = 3600) -> None:
-    """写入共享的雪球鉴权信息（默认 1 小时；过期或失效后自然重取）。"""
-    if not redis_client or not cookie:
+    """写入雪球鉴权信息（默认 1 小时；过期或失效后自然重取）。"""
+    if not cookie:
         return
     try:
-        redis_client.setex(
+        auth_store.setex(
             XUEQIU_AUTH_KEY, ttl, json.dumps({"cookie": cookie, "userAgent": user_agent})
         )
-    except Exception as e:
-        logger.warning(f"Set shared xueqiu auth failed: {e}")
+    except (TypeError, ValueError) as e:
+        logger.warning(f"Set cached xueqiu auth failed: {e}")
 
 
 def clear_xueqiu_auth() -> None:
-    """清除共享的雪球鉴权信息（收到 400/403 判定 Cookie 失效时调用）。"""
-    if not redis_client:
-        return
-    try:
-        redis_client.delete(XUEQIU_AUTH_KEY)
-    except Exception as e:
-        logger.warning(f"Clear shared xueqiu auth failed: {e}")
+    """清除雪球鉴权信息（收到 400/403 判定 Cookie 失效时调用）。"""
+    auth_store.delete(XUEQIU_AUTH_KEY)
 
+
+# ---------------------------------------------------------------------------
+# 观测
+# ---------------------------------------------------------------------------
+def describe() -> dict:
+    """缓存层快照，供 /health 展示。"""
+    return {
+        "backend": CACHE_BACKEND,
+        "stores": {
+            store.name: store.stats()
+            for store in (quote_cache, breaker_store, anchor_store, auth_store)
+        },
+    }

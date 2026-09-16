@@ -6,10 +6,10 @@
 - 主动探测：providers 注册 probe()，探测循环仅对 idle（长期无业务流量）的源兜底发起。
 - 状态机：unknown / healthy / degraded / down（idle 只是触发探测的条件，不作为对外状态）。
 
-Valkey 不可用时退化为进程内存存储（仅影响指标持久性，不影响状态判定）。
+指标存在**进程内存**（每源一个 deque 滑动窗口）：重启后窗口清零，由业务流量与主动
+探测自然重建；不做跨进程共享——本服务按单实例部署，分层依据见 core/state_store.py。
 """
 import asyncio
-import json
 import logging
 import time
 from collections import deque
@@ -17,7 +17,6 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from core import config
-from core.cache import redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -26,9 +25,7 @@ STATUS_HEALTHY = "healthy"
 STATUS_DEGRADED = "degraded"
 STATUS_DOWN = "down"
 
-_CALLS_KEY_PREFIX = "marketdata:health:calls:"
-
-# Valkey 不可用时的内存兜底
+# 每源的调用记录滑动窗口（进程内）
 _memory_calls: Dict[str, deque] = {}
 
 # 已注册的主动探针：source -> (category, probe_coro)
@@ -37,9 +34,6 @@ _probes: Dict[str, Dict[str, Any]] = {}
 # 上次状态，用于状态流转日志
 _last_status: Dict[str, str] = {}
 
-
-def _calls_key(source: str) -> str:
-    return f"{_CALLS_KEY_PREFIX}{source}"
 
 
 def register_probe(source: str, category: str, probe: Callable[[], Awaitable[None]]) -> None:
@@ -52,28 +46,12 @@ def registered_sources() -> List[str]:
 
 
 def _append_call(source: str, record: dict) -> None:
-    window = config.HEALTH_WINDOW_SIZE
-    if redis_client is not None:
-        try:
-            key = _calls_key(source)
-            pipe = redis_client.pipeline()
-            pipe.rpush(key, json.dumps(record, ensure_ascii=False))
-            pipe.ltrim(key, -window, -1)
-            pipe.execute()
-            return
-        except Exception as e:
-            logger.warning(f"Record health call to Valkey failed for {source}: {e}")
-    buf = _memory_calls.setdefault(source, deque(maxlen=window))
+    """追加一次调用记录，只保留最近 HEALTH_WINDOW_SIZE 条。"""
+    buf = _memory_calls.setdefault(source, deque(maxlen=config.HEALTH_WINDOW_SIZE))
     buf.append(record)
 
 
 def _read_calls(source: str) -> List[dict]:
-    if redis_client is not None:
-        try:
-            raw = redis_client.lrange(_calls_key(source), 0, -1)
-            return [json.loads(r) for r in raw]
-        except Exception as e:
-            logger.warning(f"Read health calls from Valkey failed for {source}: {e}")
     return list(_memory_calls.get(source, ()))
 
 
@@ -146,7 +124,7 @@ def get_source_health(source: str) -> Dict[str, Any]:
         "last_call_at": _fmt_ts(last_call["ts"]) if last_call else None,
         "last_success_at": _fmt_ts(last_success["ts"]) if last_success else None,
         "last_error": last_call.get("error") if last_call and not last_call["ok"] else None,
-        "storage": "valkey" if redis_client is not None else "memory",
+        "storage": "memory",
     }
 
 
