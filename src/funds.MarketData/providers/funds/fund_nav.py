@@ -3,7 +3,6 @@
 基金净值业务门面（Provider）：
 负责协调数据源调度（EastmoneySource / CmtidpSource）与时序增量持久化缓存（TimeSeriesCacheManager）。
 """
-import inspect
 import logging
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -66,14 +65,10 @@ class FundNavProvider:
                     page_dicts = [item.model_dump() for item in page_items]
                     await on_chunk(page_dicts, cov_s, cov_e)
 
-            has_on_page = False
-            try:
-                sig = inspect.signature(src_obj.get_fund_nav_history)
-                has_on_page = "on_page" in sig.parameters
-            except (TypeError, ValueError):
-                has_on_page = False
-
-            if has_on_page:
+            # 能力走**显式声明**（FundNavSource.supports_streaming），不再用 inspect.signature 猜：
+            # 签名探测把 `**kwargs` 形式的实现误判为不支持流式，会让缓存层以为有逐页落盘、实际没有。
+            # 只有显式 True 才算支持（Mock 等非 bool 值一律按不支持处理）。
+            if getattr(src_obj, "supports_streaming", False) is True:
                 items = await src_obj.get_fund_nav_history(
                     norm_code, start_date=s, end_date=e, on_page=_on_page_cb
                 )

@@ -16,9 +16,18 @@ from core.models import FundNav
 
 
 class FundNavSource(ABC):
-    """净值原子数据源统一接口。实现类需同时提供健康探针（SourceProbe）。"""
+    """净值原子数据源统一接口。实现类需同时提供健康探针（SourceProbe）。
+
+    **能力必须显式声明，不要靠 `inspect.signature` 猜**：
+    调用方（`FundNavProvider`）按 `supports_streaming` 决定是否传 `on_page`。
+    旧实现用签名探测，`**kwargs` 形式的实现会被误判为「不支持流式」——
+    于是缓存层以为有逐页落盘、实际没有，中途失败整段作废（D4）。
+    """
 
     name: str = ""
+
+    #: 是否支持逐页流式回调 `on_page`（实现类显式置 True）
+    supports_streaming: bool = False
 
     @abstractmethod
     async def get_latest_all_nav(self) -> List[FundNav]:

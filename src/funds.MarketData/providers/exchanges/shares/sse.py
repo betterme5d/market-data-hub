@@ -83,70 +83,83 @@ class SseShareSource:
 
     def _parse_etf_response(
         self, resp: httpx.Response, trading_day: str, daily_records: Dict[str, Dict[str, Any]]
-    ) -> None:
-        """解析上交所常规 ETF 与 货币 ETF 接口响应。"""
-        try:
-            data = resp.json()
-            for item in data.get("result", []):
-                sec_code = str(item.get("SEC_CODE", "")).strip().zfill(6)
-                if not (len(sec_code) == 6 and sec_code.isdigit()):
-                    continue
-                name = str(item.get("SEC_NAME", "")).strip() or None
-                stat_date = str(item.get("STAT_DATE", trading_day)).strip()
-                tot_vol_str = str(item.get("TOT_VOL", "")).replace(",", "").strip()
-                if not tot_vol_str:
-                    continue
-                try:
-                    shares = float(tot_vol_str)  # 上游已是万份
-                    raw_shares = round(shares * 10000.0, 2)
-                except (ValueError, TypeError):
-                    continue
+    ) -> int:
+        """解析上交所常规 ETF 与 货币 ETF 接口响应，返回**成功解析的记录数**。
 
-                daily_records[sec_code] = {
-                    "code": sec_code,
-                    "share_date": stat_date,
-                    "shares": shares,
-                    "raw_shares": raw_shares,
-                    "name": name,
-                }
-        except Exception as e:
-            logger.warning(f"Failed to parse SSE ETF response for {trading_day}: {e}")
+        结构不可解析（非 JSON / `result` 不是数组）一律抛异常，由调用方判为「不完整」。
+        绝不能吞掉异常：上游 200 + 结构变更 / 风控页会被误判成「当日无数据」，
+        该交易日随后进入覆盖区间，缺失的份额数据被永久固化（覆盖区间一旦标记就不再问上游）。
+        """
+        data = resp.json()
+        if not isinstance(data, dict) or not isinstance(data.get("result"), list):
+            raise ValueError(
+                f"unexpected SSE ETF payload shape for {trading_day}: {type(data).__name__}"
+            )
+        parsed = 0
+        for item in data["result"]:
+            sec_code = str(item.get("SEC_CODE", "")).strip().zfill(6)
+            if not (len(sec_code) == 6 and sec_code.isdigit()):
+                continue
+            name = str(item.get("SEC_NAME", "")).strip() or None
+            stat_date = str(item.get("STAT_DATE", trading_day)).strip()
+            tot_vol_str = str(item.get("TOT_VOL", "")).replace(",", "").strip()
+            if not tot_vol_str:
+                continue
+            try:
+                shares = float(tot_vol_str)  # 上游已是万份
+                raw_shares = round(shares * 10000.0, 2)
+            except (ValueError, TypeError):
+                continue
+
+            daily_records[sec_code] = {
+                "code": sec_code,
+                "share_date": stat_date,
+                "shares": shares,
+                "raw_shares": raw_shares,
+                "name": name,
+            }
+            parsed += 1
+        return parsed
 
     def _parse_lof_response(
         self, resp: httpx.Response, trading_day: str, daily_records: Dict[str, Dict[str, Any]]
-    ) -> None:
-        """解析上交所 LOF 基金接口响应。"""
-        try:
-            data = resp.json()
-            for item in data.get("result", []):
-                fund_code = str(item.get("FUND_CODE", "")).strip().zfill(6)
-                if not (len(fund_code) == 6 and fund_code.isdigit()):
-                    continue
-                name = str(item.get("FUND_ABBR", item.get("SEC_NAME_FULL", ""))).strip() or None
-                raw_date = str(item.get("TRADE_DATE", trading_day)).strip()
-                if len(raw_date) == 8 and raw_date.isdigit():
-                    share_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}"
-                else:
-                    share_date = raw_date
+    ) -> int:
+        """解析上交所 LOF 基金接口响应，返回**成功解析的记录数**（异常语义同 `_parse_etf_response`）。"""
+        data = resp.json()
+        if not isinstance(data, dict) or not isinstance(data.get("result"), list):
+            raise ValueError(
+                f"unexpected SSE LOF payload shape for {trading_day}: {type(data).__name__}"
+            )
+        parsed = 0
+        for item in data["result"]:
+            fund_code = str(item.get("FUND_CODE", "")).strip().zfill(6)
+            if not (len(fund_code) == 6 and fund_code.isdigit()):
+                continue
+            name = str(item.get("FUND_ABBR", item.get("SEC_NAME_FULL", ""))).strip() or None
+            raw_date = str(item.get("TRADE_DATE", trading_day)).strip()
+            if len(raw_date) == 8 and raw_date.isdigit():
+                share_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}"
+            else:
+                share_date = raw_date
 
-                vol_str = str(item.get("INTERNAL_VOL", "")).replace(",", "").strip()
-                if not vol_str:
-                    continue
-                try:
-                    shares = float(vol_str)  # 上游已是万份
-                    raw_shares = round(shares * 10000.0, 2)
-                except (ValueError, TypeError):
-                    continue
+            vol_str = str(item.get("INTERNAL_VOL", "")).replace(",", "").strip()
+            if not vol_str:
+                continue
+            try:
+                shares = float(vol_str)  # 上游已是万份
+                raw_shares = round(shares * 10000.0, 2)
+            except (ValueError, TypeError):
+                continue
 
-                daily_records[fund_code] = {
-                    "code": fund_code,
-                    "share_date": share_date,
-                    "shares": shares,
-                    "raw_shares": raw_shares,
-                    "name": name,
-                }
-        except Exception as e:
-            logger.warning(f"Failed to parse SSE LOF response for {trading_day}: {e}")
+            daily_records[fund_code] = {
+                "code": fund_code,
+                "share_date": share_date,
+                "shares": shares,
+                "raw_shares": raw_shares,
+                "name": name,
+            }
+            parsed += 1
+        return parsed
 
     async def fetch_daily_market_shares(self, trading_day: str) -> Dict[str, Dict[str, Any]]:
         """
@@ -166,8 +179,11 @@ class SseShareSource:
         """
         单交易日全市场份额，附完整性标记：返回 (当日记录, 是否完整)。
 
-        任一分类接口异常或非 200 即为**不完整**。调用方（区间拉取）必须据此把这一天排除在
-        覆盖区间之外——否则那天缺的那一类基金会永久缺失（覆盖区间一旦标记就不会再问上游）。
+        判为**不完整**的三种情形（调用方必须据此把这一天排除在覆盖区间之外——
+        否则那天缺的那一类基金会永久缺失，因为覆盖区间一旦标记就不会再问上游）：
+        1. 任一分类接口请求异常或非 200；
+        2. 任一分类接口 HTTP 200 但载荷不可用（非 JSON / 结构变更 / 被风控页替换）；
+        3. 所有已激活的分类接口都解析出 0 条记录（交易日不可能出现）。
         """
         if trading_day < SSE_SHARE_ABSOLUTE_EARLIEST_DATE:
             # 早于上交所最早数据产生日：源侧明确无数据，属于"完整"（可以标记覆盖）
@@ -224,6 +240,7 @@ class SseShareSource:
             responses = await asyncio.gather(*tasks, return_exceptions=True)
 
         complete = True
+        parsed_counts: Dict[str, int] = {}
         for t_type, resp in zip(task_types, responses):
             if isinstance(resp, Exception):
                 logger.warning(f"SSE {t_type} fetch failed for {trading_day}: {resp}")
@@ -234,10 +251,27 @@ class SseShareSource:
                 complete = False
                 continue
 
-            if t_type in ("etf", "money_etf"):
-                self._parse_etf_response(resp, trading_day, daily_records)
-            elif t_type == "lof":
-                self._parse_lof_response(resp, trading_day, daily_records)
+            try:
+                if t_type in ("etf", "money_etf"):
+                    parsed_counts[t_type] = self._parse_etf_response(resp, trading_day, daily_records)
+                elif t_type == "lof":
+                    parsed_counts[t_type] = self._parse_lof_response(resp, trading_day, daily_records)
+            except Exception as e:
+                # 200 但载荷不可用（非 JSON / 结构变更 / 风控页）：这是"接口坏了"，不是"当日无数据"，
+                # 必须判为不完整，否则该交易日会被标成已覆盖、缺失数据永久固化。
+                logger.warning(
+                    f"SSE {t_type} payload unusable for {trading_day}: {e}; 该日判为不完整"
+                )
+                complete = False
+
+        # 已激活的分类接口**全部**没解析出记录：交易日不可能出现（2012-01-04 起每个交易日都有 ETF 披露），
+        # 按上游静默失效处理。至少一个接口有记录时才认"完整"，避免正常交易日被误判而反复重取。
+        if complete and task_types and all(parsed_counts.get(t, 0) == 0 for t in task_types):
+            logger.warning(
+                f"SSE all {len(task_types)} classification interfaces returned 0 records for "
+                f"{trading_day}; 判为不完整（不标记覆盖，留给下次重取）"
+            )
+            complete = False
 
         return daily_records, complete
 
@@ -363,7 +397,12 @@ class SseShareProbe(SourceProbe):
         past_trading_days = [d for d in trading_days if d < today_str]
         latest_trade_day = past_trading_days[-1] if past_trading_days else (trading_days[-1] if trading_days else today_str)
 
-        # 探测单日全市场接口
-        res = await self.source.fetch_daily_market_shares(latest_trade_day)
+        # 探测单日全市场接口（用带完整性标记的版本：只判"有数据"会漏掉"某分类接口已失效"）
+        res, complete = await self.source.fetch_daily_market_shares_checked(latest_trade_day)
         if not isinstance(res, dict) or len(res) < 50:
             raise ValueError(f"SseShareProbe expected >=50 funds, got {len(res) if isinstance(res, dict) else type(res)}")
+        if not complete:
+            raise ValueError(
+                f"SseShareProbe: {latest_trade_day} 分类接口不完整（有接口失败/载荷不可用/全部为空），"
+                f"疑似上游接口变更或风控拦截"
+            )

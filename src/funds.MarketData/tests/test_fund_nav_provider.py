@@ -7,6 +7,7 @@ import pytest
 
 from core.models import FundNav
 from core.timeseries_cache.manager import TimeSeriesCacheManager
+from providers.funds.base_nav import FundNavSource
 from providers.funds.fund_nav import FundNavProvider
 
 # 测试产物落在系统临时目录：仓库目录被 dev 容器挂载并 watch，
@@ -211,3 +212,80 @@ async def test_cmtidp_partial_persist_on_midway_failure():
     )
     assert meta is not None, "第一页必须已落盘（on_page 流式）"
     assert meta["intervals"] == [["2026-09-09", "2026-09-09"]]
+
+
+# ---------------------------------------------------------------------------
+# C1：逐页流式能力改为「显式声明」，不再用 inspect.signature 隐式探测
+# ---------------------------------------------------------------------------
+
+
+class _KwargsStreamSource(FundNavSource):
+    """用 **kwargs 接收 on_page：inspect.signature 看不到具名参数，会被误判为不支持流式。"""
+
+    name = "kw"
+    supports_streaming = True
+
+    def __init__(self):
+        self.received_on_page = False
+
+    async def get_latest_all_nav(self):
+        return []
+
+    async def get_fund_nav_history(self, code, start_date=None, end_date=None, **kwargs):
+        self.received_on_page = kwargs.get("on_page") is not None
+        return [FundNav(code=code, nav_date="2024-01-02", unit_nav=1.0)]
+
+
+class _DeclaredNoStreamSource(FundNavSource):
+    """签名里有 on_page，但显式声明不支持流式 → 不得传入。"""
+
+    name = "nostream"
+    supports_streaming = False
+
+    def __init__(self):
+        self.received_on_page = False
+
+    async def get_latest_all_nav(self):
+        return []
+
+    async def get_fund_nav_history(self, code, start_date=None, end_date=None, on_page=None):
+        self.received_on_page = on_page is not None
+        return [FundNav(code=code, nav_date="2024-01-02", unit_nav=1.0)]
+
+
+@pytest.mark.asyncio
+async def test_streaming_capability_is_declared_not_inspected():
+    """C1：声明 supports_streaming=True 就必须收到 on_page（**kwargs 形式也要能收到）。
+
+    旧实现用 `inspect.signature(...).parameters` 探测，`**kwargs` 形式会被误判为不支持，
+    于是「缓存层以为有逐页落盘、实际没有」，中途失败整段作废。
+    """
+    cache_manager = TimeSeriesCacheManager(base_dir=TEST_CACHE_DIR)
+    src = _KwargsStreamSource()
+    provider = FundNavProvider(cache_manager=cache_manager, eastmoney_source=src)
+
+    await provider.get_fund_nav_history("510300", "2024-01-01", "2024-01-10", source="eastmoney")
+
+    assert src.received_on_page is True
+
+
+@pytest.mark.asyncio
+async def test_streaming_capability_false_blocks_on_page():
+    """C1：显式声明 supports_streaming=False 时不得传 on_page（哪怕签名里有）。"""
+    cache_manager = TimeSeriesCacheManager(base_dir=TEST_CACHE_DIR)
+    src = _DeclaredNoStreamSource()
+    provider = FundNavProvider(cache_manager=cache_manager, eastmoney_source=src)
+
+    await provider.get_fund_nav_history("510300", "2024-01-01", "2024-01-10", source="eastmoney")
+
+    assert src.received_on_page is False
+
+
+def test_builtin_sources_declare_streaming_capability():
+    """两个内置源都必须显式声明支持流式，否则逐页落盘会静默退化。"""
+    from providers.funds.cmtidp import CmtidpSource
+    from providers.funds.eastmoney import EastmoneySource
+
+    assert FundNavSource.supports_streaming is False, "基类默认不支持，由实现方显式开启"
+    assert EastmoneySource.supports_streaming is True
+    assert CmtidpSource.supports_streaming is True

@@ -60,6 +60,9 @@ class CmtidpProbe(SourceProbe):
 
 
 class CmtidpSource(FundNavProvider):
+    #: 支持逐页流式回调（见 FundNavSource.supports_streaming）
+    supports_streaming = True
+
     def __init__(self, base_url: str | None = None):
         self.base_url = (base_url or config.CMTIDP_BASE_URL).rstrip("/")
 
@@ -211,6 +214,13 @@ class CmtidpSource(FundNavProvider):
 
                 start += len(rows)
                 if not rows:
+                    # 空页但 offset 未达上游自述总数：上游限流/抖动常表现为「HTTP 200 + 空 aaData」，
+                    # 必须与历史净值路径同判据（抛错），否则会把 1/30000 行当成功结果返回。
+                    if total and start < total:
+                        raise RuntimeError(
+                            f"CMTIDP 最新净值不完整（{nav_day}）：已取 {start}/{total} 行时上游返回空页；"
+                            f"不完整，拒绝返回半份数据"
+                        )
                     break
                 if total and start >= total:
                     break

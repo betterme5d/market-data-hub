@@ -394,3 +394,124 @@ async def test_latest_all_nav_applies_polite_delay_between_pages():
         await source.get_latest_all_nav()
 
     assert delay.call_count >= 2, "翻页 + 换榜单 都要延时"
+
+
+# ---------------------------------------------------------------------------
+# N6：单位净值为空、只有累计净值的行不得放行（与 CMTIDP 路径口径一致）
+# N7：完整性/翻页判据不得在解析失败时静默降级；rank 分页要能重试
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_latest_all_nav_skips_row_without_unit_nav():
+    """N6：单位净值为空的行必须丢弃；只有累计净值有值也不行。
+
+    CMTIDP 路径是 `if unit_nav is None: continue`，两条净值源对同一概念必须同口径，
+    否则 C# 侧（按 NetValue is not null 过滤）会拿到「有记录但单位净值为空」的脏行。
+    """
+    source = EastmoneySource()
+    by_dt = {
+        "fb": [_rank_page([
+            _rank_row("510300", "2026-09-11", "", "2.0252"),        # 只有累计净值 → 丢弃
+            _rank_row("159915", "2026-09-11", "1.2345", ""),        # 只有单位净值 → 保留
+        ])],
+        "kf": [],
+    }
+    with ExitStack() as stack:
+        for patcher in _patch_rank(by_dt):
+            stack.enter_context(patcher)
+        items = await source.get_latest_all_nav()
+
+    assert {it.code: (it.unit_nav, it.accum_nav) for it in items} == {
+        "159915": (1.2345, None),
+    }
+
+
+@pytest.mark.asyncio
+async def test_latest_all_nav_raises_when_completeness_metadata_missing():
+    """N7：allRecords/allPages 都解析不到时，旧实现退化成「只取首页且不校验」。
+
+    上游改字段名/改报文格式时，这等于静默丢数据（dt=kf 自述 24459 条而单页上限 20000），
+    必须显式报错。
+    """
+    source = EastmoneySource()
+    by_dt = {
+        "fb": [{"rows": [_rank_row("510300", "2026-09-11", "1.0", "1.0")], "all_records": None, "all_pages": None}],
+        "kf": [{"rows": [_rank_row("161725", "2026-09-11", "1.0", "1.0")], "all_records": None, "all_pages": None}],
+    }
+    with ExitStack() as stack:
+        for patcher in _patch_rank(by_dt):
+            stack.enter_context(patcher)
+        with pytest.raises(RuntimeError, match="allRecords"):
+            await source.get_latest_all_nav()
+
+
+@pytest.mark.asyncio
+async def test_latest_all_nav_derives_pages_when_all_pages_missing():
+    """N7：allPages 缺失但 allRecords 可得时，按总数推导页数，不得只取首页。"""
+    source = EastmoneySource()
+    by_dt = {
+        "fb": [
+            {"rows": [_rank_row("510300", "2026-09-11", "1.0", "1.0"),
+                      _rank_row("159915", "2026-09-11", "2.0", "2.0")],
+             "all_records": 3, "all_pages": None},
+            {"rows": [_rank_row("161725", "2026-09-11", "3.0", "3.0")],
+             "all_records": 3, "all_pages": None},
+        ],
+        "kf": [],
+    }
+    with ExitStack() as stack:
+        for patcher in _patch_rank(by_dt):
+            stack.enter_context(patcher)
+        stack.enter_context(patch("providers.funds.eastmoney._EM_RANK_PAGE_SIZE", 2))
+        items = await source.get_latest_all_nav()
+
+    assert sorted(it.code for it in items) == ["159915", "161725", "510300"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_rank_page_retries_transient_failure():
+    """N7：rank 分页此前一次都不重试，单次网络抖动就会让整批全量净值失败。"""
+    source = EastmoneySource()
+    calls = {"n": 0}
+
+    class _Resp:
+        status_code = 200
+        text = 'var rankData={datas:["510300,300ETF,PY,2026-09-11,1.0,1.0,-1.23"],allRecords:1,allPages:1};'
+
+        def raise_for_status(self):
+            return None
+
+    async def _get(url, params=None, headers=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("connection reset by peer")
+        return _Resp()
+
+    with patch("httpx.AsyncClient.get", side_effect=_get), patch(
+        "asyncio.sleep", new_callable=AsyncMock
+    ):
+        data = await source._fetch_rank_page("fb", 1, 20000)
+
+    assert calls["n"] == 2, "首次失败必须重试"
+    assert data["all_records"] == 1
+    assert data["rows"][0].startswith("510300")
+
+
+@pytest.mark.asyncio
+async def test_fetch_rank_page_returns_none_after_exhausting_retries():
+    """重试耗尽仍失败 → 返回 None，由调用方抛「不完整」错误（不静默降级）。"""
+    source = EastmoneySource()
+    calls = {"n": 0}
+
+    async def _get(url, params=None, headers=None):
+        calls["n"] += 1
+        raise RuntimeError("upstream down")
+
+    with patch("httpx.AsyncClient.get", side_effect=_get), patch(
+        "asyncio.sleep", new_callable=AsyncMock
+    ):
+        data = await source._fetch_rank_page("fb", 1, 20000)
+
+    assert data is None
+    assert calls["n"] == 3

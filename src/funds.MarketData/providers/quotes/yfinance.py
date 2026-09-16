@@ -4,7 +4,7 @@ import math
 import pytz
 import pandas as pd
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 from core.models import UnifiedQuote
@@ -71,48 +71,70 @@ def safe_float(val, default=0.0) -> float:
     except (ValueError, TypeError):
         return default
 
-def get_market_ttl(fast_info) -> int:
-    """
-    根据市场状态动态计算缓存有效时间(TTL)，支持跨周末识别
+
+# 交易时段窗口（交易所本地时间，小时）：覆盖盘前 04:00 至盘后 20:00。
+# 窗口内按短 TTL 刷新；窗口外（收盘/周末）把缓存撑到下一个工作日 04:00。
+_SESSION_START_HOUR = 4
+_SESSION_END_HOUR = 20
+_MIN_TTL = 600
+_MAX_TTL = 259200  # 3 天
+
+
+def _resolve_tz(name) -> "pytz.BaseTzInfo":
+    """把交易所时区名解析为 tzinfo；缺失/非法一律回落 UTC（不能因此抛错）。"""
+    if isinstance(name, str) and name.strip():
+        try:
+            return pytz.timezone(name.strip())
+        except Exception:
+            logger.warning(f"Unknown exchange timezone {name!r}; falling back to UTC")
+    return pytz.UTC
+
+
+def _next_session_start(now_tz: datetime) -> datetime:
+    """下一个交易时段起点（本地时区的工作日 04:00，含今天尚未到达的那次）。"""
+    for offset in range(0, 8):
+        cand = (now_tz + timedelta(days=offset)).replace(
+            hour=_SESSION_START_HOUR, minute=0, second=0, microsecond=0
+        )
+        if cand.weekday() < 5 and cand > now_tz:
+            return cand
+    return now_tz + timedelta(hours=1)  # 理论不可达的兜底
+
+
+def get_market_ttl(fast_info, now: Optional[datetime] = None) -> int:
+    """按交易所本地时间估算行情缓存 TTL，支持跨周末识别。
+
+    **不再读 `fast_info.market_state`**：yfinance 的 FastInfo 没有该属性
+    （键列表见 yfinance/scrapers/quote.py 的 `_properties`，且该类未自定义 `__getattr__`），
+    旧实现的 `getattr(fast, "market_state", "REGULAR")` 永远拿到默认值 REGULAR，
+    「收盘后延到次日」的整段逻辑从未生效 —— 收盘后与周末仍按 10 分钟打上游。
+
+    现改为纯时间判定：
+      - 交易日窗口内（工作日 04:00~20:00，覆盖盘前/盘后）→ `_MIN_TTL`（10 分钟）；
+      - 窗口外 → 缓存撑到下一个工作日 04:00（上限 3 天，下限 10 分钟）。
+
+    :param now: 便于测试注入的「当前时间」（建议传 tz-aware；naive 按 UTC 处理）。
     """
     try:
-        # 获取市场状态: REGULAR, PRE, POST, CLOSED
-        state = getattr(fast_info, 'market_state', 'REGULAR') or 'REGULAR'
-        state = state.upper()
-        
-        # 如果是交易时段（含盘前盘后），保持 10 分钟更新
-        if state != 'CLOSED' and state != 'POSTPOST':
-            return 600
-        
-        # 如果已收盘，计算距离下一个交易日盘前的时间
-        tz_name = getattr(fast_info, 'timezone', 'UTC')
-        if not tz_name or not isinstance(tz_name, str):
-            tz_name = 'UTC'
-            
-        try:
-            tz = pytz.timezone(tz_name)
-        except Exception:
-            tz = pytz.timezone('UTC')
-            
-        now_tz = datetime.now(tz)
-        
-        # 计算需要增加的天数
-        weekday = now_tz.weekday()
-        days_to_add = 1
-        
-        if weekday == 4: # 周五收盘 -> 延至周一
-            days_to_add = 3
-        elif weekday == 5: # 周六 -> 延至周一
-            days_to_add = 2
-        
-        # 目标时间：下一个交易日的凌晨 04:00
-        target_time = (now_tz + timedelta(days=days_to_add)).replace(hour=4, minute=0, second=0, microsecond=0)
-        
-        ttl = int((target_time - now_tz).total_seconds())
-        return max(600, min(ttl, 259200))
+        tz = _resolve_tz(getattr(fast_info, "timezone", None))
+        now_tz = now or datetime.now(timezone.utc)
+        if now_tz.tzinfo is None:
+            now_tz = now_tz.replace(tzinfo=timezone.utc)
+        now_tz = now_tz.astimezone(tz)
+
+        minutes = now_tz.hour * 60 + now_tz.minute
+        in_session = (
+            now_tz.weekday() < 5
+            and _SESSION_START_HOUR * 60 <= minutes < _SESSION_END_HOUR * 60
+        )
+        if in_session:
+            return _MIN_TTL
+
+        ttl = int((_next_session_start(now_tz) - now_tz).total_seconds())
+        return max(_MIN_TTL, min(ttl, _MAX_TTL))
     except Exception as e:
         logger.warning(f"Calculate TTL failed: {e}")
-        return 600
+        return _MIN_TTL
 
 def _fetch_quote_sync(symbol: str) -> dict:
     """阻塞式拉取 yfinance 报价原始字段（**必须**在工作线程里调用）。

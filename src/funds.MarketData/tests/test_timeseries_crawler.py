@@ -330,3 +330,40 @@ async def test_crawler_short_page_without_total_confirmed_by_empty_page():
     assert len(items) == 1
     assert covered == [("2024-01-01", "2024-01-31")]
 
+
+@pytest.mark.asyncio
+async def test_crawler_page_cap_does_not_claim_coverage_and_raises():
+    """N3：上游被限流成「每页固定条数封顶」时，页数兜底不得把覆盖区间标到请求起点。
+
+    旧实现把「达到页数上限」当成「末页」，而末页规则会把覆盖下界一路延到请求起点，
+    于是 [请求起点, 实际取到的最旧日期] 这段空洞被永久标成「已覆盖」，永不重取。
+    正确行为：已取到的页按各自日期范围落盘（不放大），并显式报错，绝不静默返回半份。
+    """
+    crawler = PaginatedSliceCrawler(min_delay=0, max_delay=0)
+
+    async def fetch_page(page_index, page_size, s_, e_):
+        # 恒定只回 50 条（< page_size=200），但自述总数很大
+        return PageBatch(
+            items=[{"date": f"2026-06-{(page_index % 28) + 1:02d}"} for _ in range(50)],
+            total_count=20000,
+        )
+
+    covered = []
+
+    async def _on_page(recs, cs, ce):
+        covered.append((cs, ce))
+
+    with pytest.raises(RuntimeError, match="页数上限"):
+        await crawler.crawl_slice(
+            "2016-01-01", "2026-06-25",
+            page_size=200,
+            fetch_page_fn=fetch_page,
+            date_getter=lambda x: x["date"],
+            order="desc",
+            on_page=_on_page,
+        )
+
+    # 已取到的页仍逐页落盘，但任何一页都不得声称覆盖到请求起点
+    assert covered, "已取到的页必须逐页落盘（不能因为兜底而丢弃）"
+    assert all(cs != "2016-01-01" for cs, _ in covered), "不得把未取到的区间标成已覆盖"
+

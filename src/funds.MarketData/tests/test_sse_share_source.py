@@ -287,3 +287,110 @@ async def test_sse_pre_2012_days_are_complete():
     records, complete = await source.fetch_daily_market_shares_checked("2005-03-01")
     assert records == {}
     assert complete is True
+
+
+# ---------------------------------------------------------------------------
+# N1：HTTP 200 但响应不可用（空 result / 结构变更 / 非 JSON）必须判为「不完整」，
+# 否则该交易日会进入覆盖区间，缺失数据被永久固化（覆盖区间一旦标记就再也不会问上游）。
+# ---------------------------------------------------------------------------
+
+
+def _sse_response(json_impl, status_code: int = 200):
+    """构造一个最小 httpx 响应替身（get 的返回值）。"""
+    resp = AsyncMock()
+    resp.status_code = status_code
+    resp.raise_for_status = lambda: None
+    resp.json = json_impl
+    return resp
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case_name,json_impl",
+    [
+        ("三个接口全返回空 result", lambda sql_id: {"result": []}),
+        ("result 键缺失（上游改结构）", lambda sql_id: {"pageHelp": {"total": 0}}),
+        ("记录存在但字段缺失（TOT_VOL 全空）", lambda sql_id: {"result": [{"SEC_CODE": "510050", "SEC_NAME": "50ETF"}]}),
+    ],
+)
+async def test_sse_empty_or_malformed_payload_is_incomplete(case_name, json_impl):
+    """2026-06-25 为交易日；已激活的分类接口拿不到任何有效记录 → 必须 complete=False。
+
+    否则 fetch_market_shares_range 会把这一天并入覆盖窗口，此后永不重取。
+    """
+    source = SseShareSource(delay_ms=0)
+
+    async def mock_get(url, *args, **kwargs):
+        sql_id = kwargs.get("params", {}).get("sqlId", "")
+        return _sse_response(lambda: json_impl(sql_id))
+
+    with patch("httpx.AsyncClient.get", side_effect=mock_get):
+        records, complete = await source.fetch_daily_market_shares_checked("2026-06-25")
+
+    assert records == {}, case_name
+    assert complete is False, f"{case_name}：必须判为不完整，否则该交易日被永久固化"
+
+
+@pytest.mark.asyncio
+async def test_sse_non_json_payload_is_incomplete():
+    """HTTP 200 但响应体不是 JSON（典型：被 WAF/反爬页挡下）→ 必须 complete=False。"""
+    source = SseShareSource(delay_ms=0)
+
+    def _raise_json_error():
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    async def mock_get(url, *args, **kwargs):
+        return _sse_response(_raise_json_error)
+
+    with patch("httpx.AsyncClient.get", side_effect=mock_get):
+        records, complete = await source.fetch_daily_market_shares_checked("2026-06-25")
+
+    assert records == {}
+    assert complete is False
+
+
+@pytest.mark.asyncio
+async def test_sse_partially_parsable_day_is_still_complete():
+    """有任一分类接口拿到有效记录时仍判完整：避免把正常交易日误判为不完整而反复重取。"""
+    source = SseShareSource(delay_ms=0)
+
+    async def mock_get(url, *args, **kwargs):
+        sql_id = kwargs.get("params", {}).get("sqlId", "")
+        if "COMMON_SSE_ZQPZ_ETFZL_XXPL_ETFGM_SEARCH_L" in sql_id:
+            return _sse_response(
+                lambda: {"result": [{"SEC_CODE": "510050", "SEC_NAME": "50ETF", "TOT_VOL": "15000.5"}]}
+            )
+        # 货币 ETF / LOF 当日无数据（合法情况）
+        return _sse_response(lambda: {"result": []})
+
+    with patch("httpx.AsyncClient.get", side_effect=mock_get):
+        records, complete = await source.fetch_daily_market_shares_checked("2026-06-25")
+
+    assert list(records.keys()) == ["510050"]
+    assert complete is True
+
+
+@pytest.mark.asyncio
+async def test_sse_all_empty_day_stays_uncovered_in_range_fetch():
+    """端到端：某交易日三个接口全空 → 该日不得进入覆盖窗口，且要报进 incomplete_days。"""
+    source = SseShareSource(delay_ms=0)
+    windows = []
+
+    async def mock_checked(day):
+        if day == "2026-06-24":
+            return {}, False          # 三个接口全空 → 上游侧判为不完整
+        return {"510050": {"code": "510050", "share_date": day, "shares": 1.0}}, True
+
+    with patch.object(source, "fetch_daily_market_shares_checked", side_effect=mock_checked):
+        incomplete = []
+        records = await source.fetch_market_shares_range(
+            "2026-06-22", "2026-06-26",
+            on_window=lambda w, s, e: windows.append((s, e)),
+            flush_every_days=10,
+            incomplete_days_out=incomplete,
+        )
+
+    assert records == {}
+    # 24 日不完整 → 窗口在 23 日结束、25 日重开；24 日留洞
+    assert windows == [("2026-06-22", "2026-06-23"), ("2026-06-25", "2026-06-26")]
+    assert incomplete == ["2026-06-24"]

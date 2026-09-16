@@ -114,6 +114,45 @@ async def test_raises_on_page_failure():
 
 
 @pytest.mark.asyncio
+async def test_latest_all_nav_raises_when_empty_page_short_of_total():
+    """N2：全量最新净值遇到空页但 offset 未达 iTotalRecords → 必须抛错。
+
+    上游限流/抖动常表现为「HTTP 200 + 空 aaData」而不是报错；旧实现直接 break，
+    把 1/5 行当成成功结果返回（历史净值路径同一场景会抛错，两条路径判据必须一致）。
+    """
+    src = CmtidpSource()
+
+    async def _truncated(*, fund_code, start_date, end_date, start, length):
+        if start == 0:
+            return {"iTotalRecords": 5, "aaData": [_row("510300", start_date, "1.0")]}
+        return {"iTotalRecords": 5, "aaData": []}
+
+    with patch("providers.funds.cmtidp._szse_calendar.latest_trading_days", new_callable=AsyncMock, return_value=DAYS), patch(
+        "providers.funds.cmtidp.get_exchange_listed_codes", new_callable=AsyncMock, return_value=WHITELIST
+    ), patch.object(src, "_fetch_page", side_effect=_truncated):
+        with pytest.raises(RuntimeError, match="不完整"):
+            await src.get_latest_all_nav()
+
+
+@pytest.mark.asyncio
+async def test_latest_all_nav_empty_page_without_total_is_accepted():
+    """对照：上游未自述总数（iTotalRecords=0）时的空页属于正常收尾，不得误报。"""
+    src = CmtidpSource()
+
+    async def _no_total(*, fund_code, start_date, end_date, start, length):
+        if start == 0:
+            return {"iTotalRecords": 0, "aaData": [_row("510300", start_date, "1.0")]}
+        return {"iTotalRecords": 0, "aaData": []}
+
+    with patch("providers.funds.cmtidp._szse_calendar.latest_trading_days", new_callable=AsyncMock, return_value=DAYS), patch(
+        "providers.funds.cmtidp.get_exchange_listed_codes", new_callable=AsyncMock, return_value=WHITELIST
+    ), patch.object(src, "_fetch_page", side_effect=_no_total):
+        items = await src.get_latest_all_nav()
+
+    assert [it.code for it in items] == ["510300"]
+
+
+@pytest.mark.asyncio
 async def test_history_pagination_still_works():
     """单只基金历史净值分页回归（该路径不参与 ETF/LOF 过滤）。"""
     src = CmtidpSource()

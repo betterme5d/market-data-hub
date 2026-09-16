@@ -129,6 +129,9 @@ class EastmoneyProbe(SourceProbe):
 
 
 class EastmoneySource(FundNavProvider):
+    #: 支持逐页流式回调（见 FundNavSource.supports_streaming）
+    supports_streaming = True
+
     def __init__(self):
         self.headers = {
             "User-Agent": _UA,
@@ -683,6 +686,37 @@ class EastmoneySource(FundNavProvider):
         return text
 
 
+    @staticmethod
+    def _require_all_records(data: Dict[str, Any], dt: str) -> int:
+        """取上游自述总记录数（allRecords）；缺失/非法即抛错。
+
+        完整性判据与翻页判据同源：一旦把「解析不到」退化为 0，翻页会停在首页、
+        完整性校验也会被跳过，等于把「上游改字段名」变成静默丢数据
+        （dt=kf 自述 24459 条，而单页 pn 上限 20000）。
+        """
+        raw = data.get("all_records")
+        if raw is None:
+            raise RuntimeError(
+                f"eastmoney rank(dt={dt}) 未返回 allRecords，无法判定完整性；拒绝返回半份数据"
+            )
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            raise RuntimeError(f"eastmoney rank(dt={dt}) allRecords 非法: {raw!r}")
+
+    @staticmethod
+    def _resolve_all_pages(raw_pages: Any, all_records: int) -> int:
+        """总页数：优先用上游 allPages；缺失/非法时按 allRecords 推导（不得退化成只取首页）。"""
+        try:
+            pages = int(raw_pages) if raw_pages is not None else 0
+        except (TypeError, ValueError):
+            pages = 0
+        if pages > 0:
+            return pages
+        if all_records > 0:
+            return (all_records + _EM_RANK_PAGE_SIZE - 1) // _EM_RANK_PAGE_SIZE
+        return 1
+
     async def get_latest_all_nav(self) -> List[FundNav]:
         """获取全市场场内 ETF/LOF 的最新净值（东财场内 + 开放两个榜单合并）。
 
@@ -725,8 +759,9 @@ class EastmoneySource(FundNavProvider):
                     )
 
                 if all_pages is None:
-                    all_pages = data.get("all_pages") or 1
-                    all_records = data.get("all_records") or 0
+                    # 判据不可得时直接抛错，绝不静默退化为「只取首页且不校验完整性」
+                    all_records = self._require_all_records(data, dt)
+                    all_pages = self._resolve_all_pages(data.get("all_pages"), all_records)
 
                 rows = data.get("rows") or []
                 raw_rows += len(rows)
@@ -745,7 +780,9 @@ class EastmoneySource(FundNavProvider):
                         continue
                     unit_nav = self._to_nav_float(fields[_EM_RANK_COL_UNIT_NAV])
                     accum_nav = self._to_nav_float(fields[_EM_RANK_COL_ACCUM_NAV])
-                    if unit_nav is None and accum_nav is None:
+                    # 单位净值缺失即丢弃（与 CMTIDP 路径同口径）：只放行「只有累计净值」的行会得到
+                    # 「有记录但单位净值为空」的脏行，C# 侧按 NetValue is not null 过滤时口径就对不上。
+                    if unit_nav is None:
                         continue
                     nav_date = self._normalize_nav_date(
                         fields[_EM_RANK_COL_DATE].strip(), latest_trading_day
@@ -774,17 +811,26 @@ class EastmoneySource(FundNavProvider):
                     f"eastmoney rank(dt={dt}) incomplete: got {raw_rows} rows, "
                     f"allRecords={all_records}; 拒绝返回半份数据"
                 )
+            # 自述 0 行却返回了行：载荷不自洽，不能把「0」当成「无需校验」
+            if raw_rows and not all_records:
+                raise RuntimeError(
+                    f"eastmoney rank(dt={dt}) 自述 allRecords=0 却返回 {raw_rows} 行；"
+                    f"载荷不自洽，拒绝采信"
+                )
 
         return items
 
     async def _fetch_rank_page(
-        self, dt: str, page_index: int, page_size: int
+        self, dt: str, page_index: int, page_size: int, max_retries: int = 3
     ) -> Optional[Dict[str, Any]]:
-        """请求东财基金排行一页，返回 {rows, all_records, all_pages}；失败返回 None。
+        """请求东财基金排行一页，返回 {rows, all_records, all_pages}；重试耗尽返回 None。
 
         dt=fb：场内交易基金排行 https://fund.eastmoney.com/data/fbsfundranking.html
         dt=kf：开放基金排行     https://fund.eastmoney.com/data/fundranking.html
         行格式：逗号分隔字符串，[0]=代码 [3]=净值日期 [4]=单位净值 [5]=累计净值。
+
+        带重试：全量最新净值只有 3 次请求（fb 1 次 + kf 2 次），此前一次都不重试，
+        单次网络抖动就会让整批采集失败（lsjz 路径一直是 3 次重试，这里对齐）。
         """
         params = {
             "op": "ph",
@@ -802,15 +848,31 @@ class EastmoneySource(FundNavProvider):
             "User-Agent": _UA,
             "Referer": _EM_RANK_REFERER.get(dt, _EM_RANK_REFERER["kf"]),
         }
-        try:
-            async with httpx.AsyncClient(timeout=config.UPSTREAM_TIMEOUT, verify=False) as client:
-                resp = await client.get(_EM_RANK_URL, params=params, headers=headers)
-                resp.raise_for_status()
-                text = resp.text
-        except Exception as e:
-            logger.error(f"Fetch eastmoney rank(dt={dt}) page {page_index} failed: {e}")
-            return None
+        text: Optional[str] = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                async with httpx.AsyncClient(timeout=config.UPSTREAM_TIMEOUT, verify=False) as client:
+                    resp = await client.get(_EM_RANK_URL, params=params, headers=headers)
+                    resp.raise_for_status()
+                    text = resp.text
+                break
+            except Exception as e:
+                if attempt < max_retries:
+                    backoff = 0.2 * (2 ** (attempt - 1)) + random.uniform(0.05, 0.15)
+                    logger.warning(
+                        f"Fetch eastmoney rank(dt={dt}) page {page_index} attempt "
+                        f"{attempt}/{max_retries} failed: {e}; retrying in {backoff:.2f}s"
+                    )
+                    await asyncio.sleep(backoff)
+                else:
+                    logger.error(
+                        f"Fetch eastmoney rank(dt={dt}) page {page_index} exhausted "
+                        f"all {max_retries} retries: {e}"
+                    )
+                    return None
 
+        if text is None:
+            return None
         rows = _extract_json_array(text, "datas")
         if rows is None:
             logger.error(f"eastmoney rank(dt={dt}) page {page_index}: datas array not found")

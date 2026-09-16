@@ -87,7 +87,8 @@ class PaginatedSliceCrawler:
         page_index = start_page
         seen = 0
         total: Optional[int] = None
-        # 页数兜底：上游一直返回非空短页（限流抖动）时不能无限翻页
+        # 页数兜底：上游一直返回非空短页（限流抖动）时不能无限翻页。
+        # 命中即视为「本切片未取全」→ 抛错（不得当成末页把覆盖区间放大到请求边界）。
         max_pages = 2000
         # 总数缺失时的"疑似末页"挂起槽：(页数据, 页码)。
         # 短页只能算疑似末页，必须再取一页确认（空页=确认）；否则上游静默封顶（限流/接口变更
@@ -183,10 +184,18 @@ class PaginatedSliceCrawler:
             if total_known:
                 page_cap = min(max_pages, (total + page_size - 1) // page_size + 5)
             if page_index - start_page + 1 >= page_cap:
-                logger.warning(
-                    f"crawl_slice reached page cap {page_cap} (total={total}, seen={seen}); stopping pagination"
+                # 页数兜底只用于「别无限翻页」，**不等于**取全了：上游被限流/静默封顶（每页只回固定条数）
+                # 时这里会命中。旧实现把它当成末页，而末页规则会把覆盖下界一路延到请求起点，
+                # 于是 [请求起点, 实际取到的最旧日期] 这段空洞被永久标成「已覆盖」，永不重取。
+                # 因此：不按末页结清（已取到的页各自按真实日期范围落盘），并显式报错拒绝半份数据。
+                logger.error(
+                    f"crawl_slice reached page cap {page_cap} (total={total}, seen={seen}); "
+                    f"上游疑似按固定条数封顶，本切片未取全，拒绝返回半份数据"
                 )
-                is_last = True
+                raise RuntimeError(
+                    f"crawl_slice 达到页数上限 {page_cap}（total={total}, seen={seen}）："
+                    f"上游疑似按固定条数封顶，本切片未取全，拒绝返回半份数据"
+                )
 
             if is_last:
                 await _emit(page_items, page_index, is_last_page=True)

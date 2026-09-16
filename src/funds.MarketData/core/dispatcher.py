@@ -61,6 +61,10 @@ MAX_FAILURES = 3
 # 错误统计的滑动时间窗口 (60秒)
 FAILURE_WINDOW = 60
 
+# 批量抓取的 fallback 轮次上限：每轮为每个标的挑选「下一个尚未尝试过的允许源」，
+# 因此轮次同时充当「跨源降级次数」与「瞬时抖动重试次数」的上限（不额外增加上游压力）。
+MAX_FALLBACK_ROUNDS = 3
+
 def get_blocked_key(source: str) -> str:
     return f"marketdata:blocked:{source}"
 
@@ -308,21 +312,33 @@ class QuoteDispatcher:
         for chunk in pending_chunks:
             current_pending = chunk.copy()
             round_num = 1
-            while current_pending and round_num <= 3:
+            # 每个标的「已尝试过的源」集合（按 allowed_sources 的顺序推进）。
+            # 旧实现每轮都从头取第一个可用源，于是首源拿不到数据时会反复重试同一个源，
+            # 永远不会降级到备用源（实测双源场景调用序列 = [sina, sina, sina]）。
+            tried_sources: Dict[str, set] = {}
+            while current_pending and round_num <= MAX_FALLBACK_ROUNDS:
                 logger.info(f"Batch Dispatch Round {round_num}: Pending count={len(current_pending)} in chunk of size {len(chunk)}")
                 
                 source_groups: Dict[str, List[Tuple[Dict[str, Any], str]]] = {}
                 unsupported_items = []
 
                 for item in current_pending:
-                    allowed_sources = item.get("allowed_sources", {})
-                    
-                    # 寻找该标的允许的、未熔断的、优先级最高的源
+                    key = item["symbol"].lower()
+                    allowed_sources = item.get("allowed_sources") or {}
+                    done = tried_sources.setdefault(key, set())
+                    # 所有允许源都已试过一轮 → 清空，允许回到首源做一次「瞬时抖动」重试
+                    if len(done) >= len(allowed_sources):
+                        done.clear()
+
+                    # 寻找该标的允许的、尚未尝试过、且未熔断的源
                     allocated = False
                     for src, src_symbol in allowed_sources.items():
                         src = src.lower()
+                        if src in done:
+                            continue
                         if src in PROVIDERS and not QuoteDispatcher.is_source_blocked(src):
                             source_groups.setdefault(src, []).append((item, src_symbol))
+                            done.add(src)
                             allocated = True
                             break
                     
@@ -334,7 +350,7 @@ class QuoteDispatcher:
                     break
 
                 # 并发执行各组的批量抓取
-                async def fetch_group(source: str, group_list: List[Tuple[Dict[str, Any], str]]) -> Dict[str, UnifiedQuote]:
+                async def fetch_group(source: str, group_list: List[Tuple[Dict[str, Any], str]]) -> Tuple[Dict[str, UnifiedQuote], Optional[int]]:
                     provider = PROVIDERS[source]
                     sem = SEMAPHORES[source]
                     
@@ -342,6 +358,7 @@ class QuoteDispatcher:
                     for item, src_symbol in group_list:
                         symbol_mapping.setdefault(src_symbol.lower(), []).append(item["symbol"])
                     fetch_symbols = list(symbol_mapping.keys())
+                    group_ttl: Optional[int] = None
                     
                     async with sem:
                         started = time.monotonic()
@@ -351,16 +368,22 @@ class QuoteDispatcher:
                             if hasattr(provider, "get_quotes"):
                                 batch_results = await provider.get_quotes(fetch_symbols, with_depth=with_depth)
                             else:
-                                async def fetch_single(single_symbol: str) -> Optional[UnifiedQuote]:
+                                async def fetch_single(single_symbol: str):
                                     try:
-                                        q, _ = await provider.get_quote(single_symbol, with_depth=with_depth)
-                                        return q
+                                        q, t = await provider.get_quote(single_symbol, with_depth=with_depth)
+                                        return q, t
                                     except Exception:
-                                        return None
+                                        return None, None
                                 
                                 tasks = [fetch_single(s) for s in fetch_symbols]
                                 singles = await asyncio.gather(*tasks)
-                                batch_results = {s: q for s, q in zip(fetch_symbols, singles) if q}
+                                batch_results = {}
+                                for s, (q, t) in zip(fetch_symbols, singles):
+                                    if q:
+                                        batch_results[s] = q
+                                    if t:
+                                        # 逐个取最小 TTL：批量写缓存时按最保守的那个值
+                                        group_ttl = t if group_ttl is None else min(group_ttl, t)
                             
                             processed_results = {}
                             import copy
@@ -371,27 +394,37 @@ class QuoteDispatcher:
                                         q_copy = copy.copy(q)
                                         q_copy.symbol = std_symbol
                                         processed_results[std_symbol.lower()] = q_copy
+
+                            # 上游可达但没返回这些代码（限流 / 该源不覆盖该标的 / 已退市）：
+                            # 必须留下可观测信号，否则批量结果会静默缺项（旧实现既不降级也不计失败）。
+                            returned = {k.lower() for k in batch_results}
+                            missing = [s for s in fetch_symbols if s not in returned]
+                            if missing:
+                                logger.warning(
+                                    f"Source '{source}' returned no data for {len(missing)}/{len(fetch_symbols)} "
+                                    f"requested symbols (e.g. {missing[:5]}); 交由下一轮降级到备用源"
+                                )
                             
                             # 抓取成功，重置失败计数
                             QuoteDispatcher.reset_failures(source)
                             health.record_call(source, True, (time.monotonic() - started) * 1000)
-                            return processed_results
+                            return processed_results, group_ttl
                         except BusinessException as bex:
                             health.record_call(source, True, (time.monotonic() - started) * 1000)
                             logger.warning(f"Batch fetch business query error via '{source}': {bex}")
-                            return {}
+                            return {}, group_ttl
                         except Exception as ex:
                             health.record_call(source, False, (time.monotonic() - started) * 1000, error=str(ex))
                             logger.error(f"Batch fetch failed via '{source}': {ex}")
                             # 递增失败计数器，达到阈值才熔断
                             QuoteDispatcher.record_failure(source)
-                            return {}
+                            return {}, group_ttl
 
                 tasks = [fetch_group(src, g_list) for src, g_list in source_groups.items()]
                 group_results_list = await asyncio.gather(*tasks)
                 
                 round_success_count = 0
-                for group_res in group_results_list:
+                for group_res, group_ttl in group_results_list:
                     for std_sym, q in group_res.items():
                         results_map[std_sym] = q
                         round_success_count += 1
@@ -399,13 +432,15 @@ class QuoteDispatcher:
                         # 仅在不带深度数据时写入 Redis 缓存
                         if not with_depth and redis_client:
                             try:
-                                ttl = SOURCE_CACHE_TTL.get(
+                                # 优先用 provider 自报的 TTL（yfinance 收盘后是小时级，见 get_market_ttl），
+                                # 批量接口拿不到 TTL 时退回源级默认值
+                                ttl = group_ttl or SOURCE_CACHE_TTL.get(
                                     (q.source or "").lower(), DEFAULT_CACHE_TTL
                                 )
                                 redis_client.setex(
                                     get_quote_cache_key(std_sym), ttl, q.model_dump_json()
                                 )
-                                logger.debug(f"Successfully cached batch quote for {std_sym} to Valkey, ttl={DEFAULT_CACHE_TTL}")
+                                logger.debug(f"Successfully cached batch quote for {std_sym} to Valkey, ttl={ttl}")
                             except Exception:
                                 pass
 

@@ -18,6 +18,11 @@ from providers.exchanges.shares.szse import SzseShareSource, split_date_range
 
 logger = logging.getLogger(__name__)
 
+#: 默认「待落盘队列」上限（批次数）。每个排队中的批次都持有一份整窗全市场快照，
+#: 只限制「同时落盘」的并发数并不够——沪市按 10 个交易日一个窗口，10 年回补约 240 个窗口，
+#: 队列不设上限时会有数百 MB 常驻内存。队列满时改为同步落盘（背压，宁可短暂阻塞也不丢数据）。
+DEFAULT_MAX_PENDING_FANOUTS: int = 6
+
 
 class FundShareProvider:
     """统一基金份额服务门面（集成时序 Parquet 缓存、目标基金秒级响应与全市场并发扇出落盘）。"""
@@ -35,6 +40,7 @@ class FundShareProvider:
         sse_source: Optional[SseShareSource] = None,
         max_workers: int = 16,
         max_concurrent_fanouts: int = DEFAULT_MAX_CONCURRENT_FANOUTS,
+        max_pending_fanouts: int = DEFAULT_MAX_PENDING_FANOUTS,
     ):
         self.storage = storage or ParquetStorageEngine()
         self.tracker = tracker or IntervalTracker()
@@ -42,6 +48,7 @@ class FundShareProvider:
         self.sse_source = sse_source or SseShareSource()
         self.max_workers = max(1, int(max_workers))
         self.max_concurrent_fanouts = max(1, int(max_concurrent_fanouts))
+        self.max_pending_fanouts = max(1, int(max_pending_fanouts))
 
         # 交易所级并发锁，防止同一交易所并发批量抓取造成的资源踩踏与重复请求
         self._exchange_locks: Dict[str, asyncio.Lock] = {}
@@ -49,6 +56,8 @@ class FundShareProvider:
 
         # 正在后台落盘的进行中异步任务集合
         self._pending_tasks: Set[asyncio.Task] = set()
+        # 已排队（含正在落盘）的后台批次数：用于限制「待落盘队列」的内存占用
+        self._pending_fanout_count: int = 0
 
         # 内存缓冲：记录后台正在落盘中的批次数据 {(exchange, start_date, end_date): market_data}
         # 键是**实际拉取的窗口区间**；查询时按"区间包含"匹配（见 _serve_from_in_memory_batch）
@@ -330,6 +339,17 @@ class FundShareProvider:
                 return
 
             # 大批量全市场（如 800+ 只基金）：
+            # 待落盘队列已满 → 改为同步落盘（背压）。队列里的每个批次都持有「一整个窗口的
+            # 全市场快照」，不设上限时沪市 10 年回补（约 240 个窗口）会让数百 MB 常驻内存；
+            # 这里宁可短暂阻塞上游抓取循环，也不丢数据（同步落盘与后台落盘写的是同一套文件）。
+            if self._pending_fanout_count >= self.max_pending_fanouts:
+                logger.warning(
+                    f"扇出待落盘队列已满（{self._pending_fanout_count}/{self.max_pending_fanouts}），"
+                    f"窗口 [{chunk_s} ~ {chunk_e}] 改为同步落盘以限制内存占用"
+                )
+                self._persist_items_sync(remaining_items, chunk_s, chunk_e, dims, namespace)
+                return
+
             # 暂存内存缓冲字典供瞬时并发查询直接使用（键 = 实际拉取窗口区间）
             batch_key = (dims.get("exchange", ""), chunk_s, chunk_e)
             self._in_memory_batches[batch_key] = market_data
@@ -344,10 +364,13 @@ class FundShareProvider:
             except BaseException:
                 self._in_memory_batches.pop(batch_key, None)
                 raise
+            self._pending_fanout_count += 1
             # 槽位所有权已移交后台任务（它在 finally 里释放），此处不再由本方法释放
             slot = None
             self._pending_tasks.add(task)
-            task.add_done_callback(self._pending_tasks.discard)
+            # 用 done_callback 归还队列配额：它保证恰好触发一次（连「任务还没启动就被取消」
+            # 这种情况也能归还），否则配额会被假性占满、后续窗口全部退化到同步落盘。
+            task.add_done_callback(self._on_fanout_task_done)
         finally:
             if slot is not None:
                 slot.release()
@@ -371,6 +394,36 @@ class FundShareProvider:
             )
             for code, records in items
         ))
+
+    def _on_fanout_task_done(self, task: asyncio.Task) -> None:
+        """后台扇出任务收尾：移出在飞集合并归还「待落盘队列」配额（恰好一次）。"""
+        self._pending_tasks.discard(task)
+        self._pending_fanout_count = max(0, self._pending_fanout_count - 1)
+
+    def _persist_items_sync(
+        self,
+        items: List[Tuple[str, List[Dict[str, Any]]]],
+        chunk_s: str,
+        chunk_e: str,
+        dims: Dict[str, str],
+        namespace: str,
+    ) -> None:
+        """同步落盘（背压路径）：用常驻线程池阻塞等待本批写完。
+
+        只在「待落盘队列已满」时使用：阻塞时长与一个窗口的全市场落盘时间同量级，
+        换来的是内存占用有明确上限（每个排队批次 = 一份整窗全市场快照）。
+        """
+        if not items:
+            return
+        executor = self._get_fanout_executor()
+        list(
+            executor.map(
+                lambda item: self._persist_fund_guarded(
+                    item[0], item[1], chunk_s, chunk_e, dims, namespace
+                ),
+                items,
+            )
+        )
 
     def _persist_fund_guarded(
         self,
@@ -415,6 +468,7 @@ class FundShareProvider:
         except Exception as e:
             logger.error(f"Background fan-out persistence error for {batch_key}: {e}")
         finally:
+            # 队列配额由 _on_fanout_task_done（done_callback）归还，此处不再重复归还
             if acquired and semaphore is not None:
                 semaphore.release()
             self._in_memory_batches.pop(batch_key, None)

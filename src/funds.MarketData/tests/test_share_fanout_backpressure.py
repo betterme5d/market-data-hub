@@ -184,3 +184,118 @@ async def test_szse_fanout_backlog_and_threads_are_bounded(tmp_path: Path):
     )
     # 常驻线程池 4 + 事件循环线程上的目标基金落盘 1 = 5 为硬上限
     assert counter["peak"] <= 5, f"落盘并发峰值 {counter['peak']}，超过常驻线程池上限"
+
+
+# ---------------------------------------------------------------------------
+# N8：沪市逐窗口扇出的「待落盘队列」必须有上限
+# ---------------------------------------------------------------------------
+
+
+def _sse_windows(count: int = 20):
+    """构造 count 个互不相同的窗口（等价于沪市逐交易日/逐窗口的 on_window 回调）。"""
+    return [f"2026-06-{d:02d}" for d in range(1, count + 1)]
+
+
+async def test_sse_fanout_pending_queue_is_bounded_by_default(tmp_path: Path):
+    """N8：沪市 20 个窗口连续扇出时，待落盘队列不得超过默认上限。
+
+    每个排队中的批次都持有一份「整窗全市场快照」；旧实现只限制「同时落盘」的批次数
+    （max_concurrent_fanouts），不限制「已排队未落盘」的任务数，因此 10 年回补
+    （约 240 个窗口）会让数百 MB 常驻内存。
+    """
+    from providers.funds.shares import provider as provider_mod
+
+    bound = getattr(provider_mod, "DEFAULT_MAX_PENDING_FANOUTS", 6)
+
+    storage = ParquetStorageEngine(base_dir=tmp_path)
+    provider = FundShareProvider(
+        storage=storage,
+        tracker=IntervalTracker(),
+        max_workers=2,
+        max_concurrent_fanouts=1,
+    )
+    dims = {"exchange": "sse"}
+
+    samples = []
+    try:
+        for day in _sse_windows(20):
+            provider._dispatch_fanout_sync(
+                _sse_market(day), "510300", day, day, dims, "fund_share"
+            )
+            samples.append(len(provider._in_memory_batches))
+        await provider.wait_pending_fanouts()
+    finally:
+        _shutdown(provider)
+
+    assert samples, "用例前提：至少扇出一个窗口"
+    assert max(samples) <= bound, (
+        f"待落盘队列峰值 {max(samples)}，超过上限 {bound}（内存随回补区间线性增长）"
+    )
+
+
+async def test_sse_fanout_backpressure_does_not_lose_data(tmp_path: Path):
+    """N8 配套：队列满时改为同步落盘，数据一条都不能丢（背压 ≠ 丢弃）。"""
+    storage = ParquetStorageEngine(base_dir=tmp_path)
+    provider = FundShareProvider(
+        storage=storage,
+        tracker=IntervalTracker(),
+        max_workers=2,
+        max_concurrent_fanouts=1,
+        max_pending_fanouts=2,
+    )
+    dims = {"exchange": "sse"}
+    windows = _sse_windows(6)
+
+    try:
+        for day in windows:
+            provider._dispatch_fanout_sync(
+                _sse_market(day), "510300", day, day, dims, "fund_share"
+            )
+        await provider.wait_pending_fanouts()
+    finally:
+        _shutdown(provider)
+
+    # 目标基金 + 全市场其余基金、每个窗口，都必须落盘
+    for day in windows:
+        for code in ("510300", "510000", "510011"):
+            records = storage.read_records(
+                "fund_share", code, start_date=day, end_date=day,
+                date_column="share_date", dimensions=dims,
+            )
+            assert records, f"{code} 在 {day} 的数据未落盘（背压路径丢了数据）"
+
+    # 覆盖区间也必须被标记，否则下次会重复回源
+    meta = storage.read_metadata("fund_share", "510011", dimensions=dims) or {}
+    assert meta.get("intervals"), "背压路径未更新覆盖区间元数据"
+
+
+async def test_fanout_quota_is_returned_after_completion(tmp_path: Path):
+    """N8 配套：队列配额必须归还，否则队列会假性占满、后续窗口永久退化为同步落盘。"""
+    storage = ParquetStorageEngine(base_dir=tmp_path)
+    provider = FundShareProvider(
+        storage=storage,
+        tracker=IntervalTracker(),
+        max_workers=2,
+        max_concurrent_fanouts=1,
+        max_pending_fanouts=2,
+    )
+    dims = {"exchange": "sse"}
+
+    try:
+        for day in _sse_windows(4):
+            provider._dispatch_fanout_sync(
+                _sse_market(day), "510300", day, day, dims, "fund_share"
+            )
+        await provider.wait_pending_fanouts()
+
+        assert provider._pending_fanout_count == 0, "后台任务完成后配额未归还"
+        assert provider._in_memory_batches == {}, "在飞批次缓冲未清理"
+
+        # 队列已腾空 → 新窗口必须重新走「后台异步落盘」，而不是永久退化到同步落盘
+        provider._dispatch_fanout_sync(
+            _sse_market("2026-07-01"), "510300", "2026-07-01", "2026-07-01", dims, "fund_share"
+        )
+        assert len(provider._in_memory_batches) == 1
+        await provider.wait_pending_fanouts()
+    finally:
+        _shutdown(provider)

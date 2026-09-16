@@ -24,6 +24,10 @@ from providers.exchanges.szse import (
     SzseFundProbe,
     SzseWwwProbe,
 )
+from providers.funds.delist.provider import DelistSyncProbe, delist_sync_loop
+from providers.funds.delist.sse_bulletin import SseFundBulletinProbe
+from providers.funds.delist.szse_bulletin import SzseFundBulletinProbe
+from providers.funds.delist.xueqiu_status import XueqiuStatusProbe
 from providers.funds.cmtidp import CmtidpProbe
 from providers.funds.eastmoney import EastmoneyProbe
 from providers.funds.establish_dates import EastmoneyEstablishDateProbe
@@ -107,6 +111,12 @@ def _register_probes() -> None:
         # 公开业务接口的语义化探针（站点可达 ≠ 接口仍可用）
         SseFundListProbe(), SzseFundListProbe(), SzseCalendarProbe(),
         SzseShareProbe(), SseShareProbe(), XueqiuKlineProbe(),
+        # 退市公告：页面私有接口（无 SLA），必须语义探针兜底
+        SseFundBulletinProbe(), SzseFundBulletinProbe(),
+        # 同步任务新鲜度：接口探针证明不了「任务还在跑」，单独兜一层
+        DelistSyncProbe(),
+        # 雪球状态扫描：补充召回收不到交易所公告的退市基金（如 501023）
+        XueqiuStatusProbe(),
     )
     for provider in probes:
         health_svc.register_probe(provider.name, provider.category, provider.probe)
@@ -131,11 +141,13 @@ async def lifespan(app: FastAPI):
     _register_probes()
     stop_event = asyncio.Event()
     probe_task = asyncio.create_task(health_svc.probe_loop(stop_event))
+    delist_task = asyncio.create_task(delist_sync_loop(stop_event))
     try:
         yield
     finally:
         stop_event.set()
         await probe_task
+        await delist_task
         await _drain_share_fanouts()
 
 

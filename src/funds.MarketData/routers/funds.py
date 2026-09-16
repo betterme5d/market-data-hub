@@ -17,6 +17,7 @@ from providers.funds.eastmoney import EastmoneySource
 from providers.funds.establish_dates import EstablishDateProvider
 from providers.funds.fund_nav import FundNavProvider
 from providers.funds.shares.provider import fund_share_provider
+from providers.funds.delist.provider import delist_provider
 from providers.funds.fund_profile import (
     EastmoneyProfileSource,
     collect_fund_dates,
@@ -169,6 +170,76 @@ async def get_establish_date(code: str = Path(..., description="基金代码（6
         return await establish_date_provider.get_one(code)
     except Exception as e:
         logger.error(f"Failed to get establish date for {code}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/v1/funds/delist", tags=["基金数据"], summary="获取沪深场内基金终止上市信息")
+async def get_fund_delist(
+    start_date: str = Query(default=None, description="公告起始日 YYYY-MM-DD；留空=全量"),
+    end_date: str = Query(default=None, description="公告截止日 YYYY-MM-DD；留空=全量"),
+    limit: int = Query(default=None, ge=1, le=500,
+                       description="最多处理多少只；沪市每只需下载一份 PDF，留空=全部"),
+):
+    """抓取沪深交易所公告，解析场内基金的终止上市日。
+
+    数据来源只走交易所公告（上交所 commonQuery + 深交所 api/search/content），
+    不依赖第三方资讯站。
+
+    注意：`delist_date` 来自公告正文（终止上市日 / 摘牌时间），
+    与「最后运作日」「基金清盘」不是同一个日期，详见方案文档。
+    """
+    try:
+        records = await delist_provider.collect(
+            start_date=start_date, end_date=end_date, limit=limit)
+        return [r.to_dict() for r in records]
+    except Exception as e:
+        logger.error(f"Failed to collect fund delist: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/v1/funds/delist/{code}", tags=["基金数据"],
+            summary="按代码查询终止上市信息（没有则返回空）")
+async def get_fund_delist_by_code(
+    code: str = Path(..., min_length=6, max_length=6, description="6 位基金代码"),
+):
+    """传一个代码，直接返回该代码的终止上市信息。
+
+    数据是本地退市库的**只读**查询（常数时间），不触达上游。
+    库由后台定时任务每日增量维护；手动回填请用 CLI `scripts/sync_delist.py`
+    —— 同步要下载上百份 PDF 打上游，**刻意不暴露为 HTTP 接口**。
+
+    库里没有时返回 `{"code": "...", "found": false}`，
+    **不抛 404**：基金没退市是正常情况，不是错误。
+
+    字段语义：
+    - `delist_date`：终止上市日 / 摘牌时间（交易所公告口径）
+    - `last_operation_date`：最后运作日（深交所正文是缩略版，通常拿不到）
+    """
+    try:
+        rec = delist_provider.lookup(code)
+        if rec:
+            return {**rec, "found": True}
+        return {"code": code, "found": False}
+    except Exception as e:
+        logger.error(f"Failed to lookup delist for {code}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/v1/funds/delist/incremental", tags=["基金数据"],
+            summary="增量获取疑似退市（列表差集定位 + 公告确认）")
+async def get_fund_delist_incremental():
+    """日常增量入口：先用交易所列表差集定位候选，再查这些代码的公告确认。
+
+    相比全量（`/funds/delist`）只需下载个位数 PDF，适合每天跑。
+    首次运行只建立基线快照、不产出候选。
+
+    返回 `warnings` 非空表示上游疑似异常（列表截断/消失过多），
+    此时 `records` 可能为空 —— 宁可不出数，也不出脏数。
+    """
+    try:
+        return await delist_provider.collect_incremental()
+    except Exception as e:
+        logger.error(f"Failed to collect incremental delist: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
