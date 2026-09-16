@@ -1,0 +1,108 @@
+name: market-data-hub
+
+# 行情/爬虫服务编排（自 funds 拆库后独立部署）：
+#   market-data             FastAPI 行情 / 净值 / K 线代理（宿主 :8080）
+#   browser-proxy-gateway   爬虫网关：透传请求 + 按需唤醒 / 空闲关停 browser-proxy（宿主 :8081）
+#   browser-proxy           Playwright 爬虫主体，仅容器网内暴露 :8098，由网关拉起
+#
+# 无外部中间件依赖：缓存是进程内实现（内存 + data/state/*.json），见 core/state_store.py。
+#
+# 启动：docker compose up -d --build
+# 需要改代码即时生效时改用 docker-compose-dev.yml（源码挂载 + uvicorn --reload）
+
+# 定义日志配置锚点
+x-logging: &logging-config
+  driver: json-file
+  options:
+    max-size: "100m"
+    max-file: "3"
+
+services:
+  market-data:
+    build:
+      context: ./src/market-data
+      dockerfile: Dockerfile
+    logging: *logging-config
+    container_name: market_data
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Shanghai
+      # 服务间寻址固定走容器名，覆盖 .env 里的同名项（宿主机裸跑时才用 .env 的值）
+      - BROWSER_PROXY_URL=http://browser-proxy-gateway:8081
+    ports:
+      - "${MARKET_DATA_PORT:-8080}:8080"
+    volumes:
+      # 运行时落盘必须留在宿主机：data/ 下的 JSON 状态（含 data/state 的熔断状态、
+      # 雪球 Cookie、复权锚点）与 data/cache 的 parquet 缓存都不入库，
+      # 换机器/重建容器都不能丢，且 git 不收该目录（见 .gitignore）
+      - ./src/market-data/data:/app/data
+    # 本机老内核（CentOS 7 / 3.10）下 Docker 默认 seccomp 会拦截部分 syscall，
+    # 先例见 funds 仓库 docs/Nginx容器EPERM排障复盘.md
+    security_opt:
+      - seccomp:unconfined
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  browser-proxy-gateway:
+    build:
+      context: ./src/browser-proxy
+      dockerfile: Dockerfile.gateway
+    logging: *logging-config
+    container_name: browser_proxy_gateway
+    environment:
+      - TZ=Asia/Shanghai
+      # 网关默认值即下面两项，显式写出来是为了改容器名时只改一处
+      - BROWSER_PROXY_TARGET_URL=http://browser-proxy:8098
+      - BROWSER_PROXY_CONTAINER=browser-proxy
+      # 空闲多久关停爬虫容器（秒）
+      - BROWSER_PROXY_IDLE_LIMIT=${BROWSER_PROXY_IDLE_LIMIT:-300}
+      # 分布式追踪开关：.env 里 OTEL_EXPORTER_OTLP_ENDPOINT 取消注释即生效
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    volumes:
+      # 需要操作浏览器容器（唤醒 / 关停）
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "${BROWSER_PROXY_PORT:-8081}:8081"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import socket; socket.create_connection(('127.0.0.1', 8081), 3).close()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  browser-proxy:
+    build:
+      context: ./src/browser-proxy
+      dockerfile: Dockerfile
+    logging: *logging-config
+    container_name: browser-proxy
+    environment:
+      - TZ=Asia/Shanghai
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    # 与 main.py 内建端口一致，网关按容器名 browser-proxy:8098 直连
+    command: uvicorn main:app --host 0.0.0.0 --port 8098
+    expose:
+      - "8098"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    # 故意不用自动重启：网关空闲时会 stop 该容器，restart 策略会把它再拉起来
+    restart: "no"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8098/health', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

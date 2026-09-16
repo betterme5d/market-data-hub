@@ -8,5 +8,9 @@ RUN pip install --no-cache-dir \
     opentelemetry-sdk==1.44.0 opentelemetry-exporter-otlp-proto-http==1.44.0 opentelemetry-instrumentation-fastapi==0.65b0 opentelemetry-instrumentation-httpx==0.65b0 \
     -i http://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.aliyun.com
 
+# 复制源码：此前只装依赖不带代码，必须靠 bind mount 才能启动（生产 compose 也挂源码）；
+# 补上 COPY 后镜像自洽，dev 编排仍可用挂载覆盖以获得热重载
+COPY gateway.py ./
+
 # 默认启动 gateway.py
 CMD ["python", "gateway.py"]

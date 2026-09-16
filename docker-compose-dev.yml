@@ -1,0 +1,100 @@
+name: market-data-hub
+
+# 本地开发编排：与 docker-compose.yml 保持同一套服务、端口与挂载方式，
+# 差异只有 uvicorn --reload（改 Python 代码自动重启）。
+#
+# 用法：cp .env.example .env 后 docker compose -f docker-compose-dev.yml up -d --build
+# 测试：docker compose -f docker-compose-dev.yml exec market-data python -m pytest -q
+#   （requirements.txt 里已装 pytest / pytest-asyncio，容器本身就是测试环境）
+
+# 定义日志配置锚点
+x-logging: &logging-config
+  driver: json-file
+  options:
+    max-size: "100m"
+    max-file: "3"
+
+services:
+  market-data:
+    build:
+      context: ./src/market-data
+      dockerfile: Dockerfile
+    logging: *logging-config
+    container_name: market_data
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Shanghai
+      - BROWSER_PROXY_URL=http://browser-proxy-gateway:8081
+    ports:
+      - "${MARKET_DATA_PORT:-8080}:8080"
+    volumes:
+      - ./src/market-data:/app
+    security_opt:
+      - seccomp:unconfined
+    # 热重载：StatReload 每秒轮询 mtime，对 Windows 挂载卷最稳，改 Python 代码自动重启
+    command: uvicorn main:app --host 0.0.0.0 --port 8080 --reload
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  browser-proxy-gateway:
+    build:
+      context: ./src/browser-proxy
+      dockerfile: Dockerfile.gateway
+    logging: *logging-config
+    container_name: browser_proxy_gateway
+    environment:
+      - TZ=Asia/Shanghai
+      - BROWSER_PROXY_TARGET_URL=http://browser-proxy:8098
+      - BROWSER_PROXY_CONTAINER=browser-proxy
+      - BROWSER_PROXY_IDLE_LIMIT=${BROWSER_PROXY_IDLE_LIMIT:-300}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 改 gateway.py 后重启容器即生效（不需要重建镜像）
+      - ./src/browser-proxy:/app
+    working_dir: /app
+    ports:
+      - "${BROWSER_PROXY_PORT:-8081}:8081"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import socket; socket.create_connection(('127.0.0.1', 8081), 3).close()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  browser-proxy:
+    build:
+      context: ./src/browser-proxy
+      dockerfile: Dockerfile
+    logging: *logging-config
+    container_name: browser-proxy
+    environment:
+      - TZ=Asia/Shanghai
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    command: uvicorn main:app --host 0.0.0.0 --port 8098 --reload
+    volumes:
+      - ./src/browser-proxy:/app
+    expose:
+      - "8098"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    restart: "no"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8098/health', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
